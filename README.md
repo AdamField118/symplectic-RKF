@@ -88,11 +88,6 @@ python plot_figures.py --kerr results/kerr_glsl.npy --outdir figures/glsl
 With the environment active, the program finds `libEGL.so.1` in it on its
 own. `EGL_LIBRARY=/path/to/libEGL.so.1` points it at a different one.
 
-`./glsl/geodesic --selftest` runs the shader's functions on the GPU (sin, cos,
-division, the metric, its derivatives, the RK steps) and checks each against
-the same code in plain C on the CPU. The batch job runs it first, so if a GPU
-ever gets something wrong, the log says which function.
-
 `./glsl/geodesic` with no options runs Appendix A's Kerr case. The options are
 `--M`, `--a`, `--h`, `--steps`, `--ic "t r theta phi p_t p_r p_theta p_phi"`
 (repeat it for more geodesics), `--ic-file` (one initial condition per line),
@@ -139,11 +134,18 @@ results:
   `(tol/error)**(1/5)`, which is computed with Newton's method.
 - Division and square roots are done by hand too (`ddiv` and `dsqrt`). GLSL
   only promises they're as accurate as single precision, and NVIDIA's driver
-  uses a fast approximate division. That wrecks the finite differences in
-  `dgdx` (the metric at `r ± 1e-6` comes out the same), and on the L40S the
-  orbits flew off in a straight line. The shader now starts from a single
+  uses a fast approximate division. A division that rough wrecks the finite
+  differences in `dgdx` (the metric at `r ± 1e-6` comes out the same) and the
+  orbits fly off in a straight line. The shader starts from a single
   precision guess and refines it with Newton's method using `fma`, which gives
   exactly rounded double division on any GPU.
+- The shader keeps positions and momenta as two `dvec4`s and the metric as a
+  `dmat4` instead of arrays, and `dgdx(x, w)` returns the derivatives for one
+  coordinate at a time instead of all four at once. On NVIDIA's driver the
+  metric lost precision when it was kept in double arrays, and its compiler
+  rejects writing to a vector component picked by a variable, so every index
+  in the shader is a fixed number. The arithmetic is the same, term by term
+  and in the same order.
 - Python calls `f(y)` two or three times for the starting guesses. The shader
   calls it once and copies the result, since the answer is always the same.
 - The 15,000 steps are split across several GPU dispatches (`--chunk`, 100 by

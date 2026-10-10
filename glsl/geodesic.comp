@@ -195,11 +195,11 @@ double fifth_root(double x) {
 //
 // Positions and momenta are kept as two dvec4s, q = (t, r, theta, phi) and
 // p = (p_t, p_r, p_theta, p_phi), and the metric as a dmat4, instead of double
-// arrays. NVIDIA's driver (595.71) passes double arrays back out of functions
-// at single precision, which wrecked the finite differences in dgdx(). Its
-// compiler also can't write to a component of a double vector picked by a
-// variable (v[i] = ... fails to link), so every index below is a fixed number
-// and vectors are built whole. The arithmetic is the same as before,
+// arrays. With the metric and its derivatives in double arrays, NVIDIA's
+// driver (595.71) gave them only single precision, which wrecked the finite
+// differences in dgdx(). Its compiler also can't write to a component of a
+// double vector picked by a variable (v[i] = ... fails to link), so every
+// index below is a fixed number and vectors are built whole. The arithmetic is the same as before,
 // component by component. The metric is symmetric, so g[i][j] means the same
 // thing whichever index GLSL treats as the column.
 

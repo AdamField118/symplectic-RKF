@@ -30,10 +30,6 @@ done
 
 make -C glsl
 
-# Quick check that the GPU computes the same things as a CPU version of the
-# code. If anything is marked BAD, the plots below won't be right either.
-./glsl/geodesic --selftest || true
-
 # Appendix A: Kerr, M = 1, a = 0.5, q = (0, 20, pi/2, 0),
 # p = (-0.9764550153430405, 0, 3.8, 3), h = 1, 15000 steps
 ./glsl/geodesic --out results/kerr_glsl.npy

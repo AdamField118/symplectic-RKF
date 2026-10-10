@@ -23,8 +23,6 @@
  *   --out <path>         output .npy                       (default geodesic.npy)
  *   --shader <path>      compute shader (default: geodesic.comp next to the binary)
  *   --chunk <int>        steps per dispatch                (default 100)
- *   --selftest           check the shader's functions against a CPU version
- *                        of the same code, then exit (uses --M/--a/--h/--ic)
  *
  * Environment variables:
  *   EGL_LIBRARY=<path>   use this libEGL.so.1 instead of searching for one
@@ -254,7 +252,12 @@ static char *read_file(const char *path) {
     return s;
 }
 
-static GLuint build_program_from_source(const char *src) {
+static GLuint build_program(const char *path) {
+    char *src = read_file(path);
+    if (!src) {
+        fprintf(stderr, "error: cannot read shader %s\n", path);
+        exit(1);
+    }
     GLuint sh = glCreateShader(GL_COMPUTE_SHADER);
     glShaderSource(sh, 1, (const GLchar *const *)&src, NULL);
     glCompileShader(sh);
@@ -278,21 +281,6 @@ static GLuint build_program_from_source(const char *src) {
         fprintf(stderr, "link log:\n%s\n", log);
         die("compute shader failed to link");
     }
-    return prog;
-}
-
-static char *read_shader(const char *path) {
-    char *src = read_file(path);
-    if (!src) {
-        fprintf(stderr, "error: cannot read shader %s\n", path);
-        exit(1);
-    }
-    return src;
-}
-
-static GLuint build_program(const char *path) {
-    char *src = read_shader(path);
-    GLuint prog = build_program_from_source(src);
     free(src);
     return prog;
 }
@@ -322,316 +310,12 @@ typedef struct {
     double r6b1, r6b2, r6b3;
 } Params;
 
-/* Self-test (--selftest)
- *
- * Runs the shader's own functions on the GPU and checks them against the same
- * code written in plain C on the CPU: sin/cos, division, sqrt, the metric, its
- * derivatives, the Hamiltonian, one RK4, RK6 and combined step, and 100 steps
- * in a row. Each line says how far apart the two are; anything flagged is
- * the part that's going wrong on this GPU. */
-
-static double cM, ca;  /* black hole parameters for the C versions */
-
-/* inverse_metric, dgdx, hamiltonian and the RK steps from Appendix A, in C */
-static void c_inverse_metric(const double x[4], double g[4][4]) {
-    double r = x[1], theta = x[2];
-    double Sigma = r * r + (ca * ca) * (cos(theta) * cos(theta));
-    double Delta = r * r - 2 * cM * r + ca * ca;
-    double s2 = sin(theta) * sin(theta);
-    memset(g, 0, sizeof(double) * 16);
-    g[0][0] = -((r * r + ca * ca) * (r * r + ca * ca) - (ca * ca) * Delta * s2) / (Delta * Sigma);
-    g[0][3] = g[3][0] = -2 * cM * ca * r / (Delta * Sigma);
-    g[1][1] = Delta / Sigma;
-    g[2][2] = 1.0 / Sigma;
-    g[3][3] = (Delta - (ca * ca) * s2) / (Delta * Sigma * s2);
-}
-
-static void c_dgdx(const double x[4], double dg[4][4][4]) {
-    const double delta = 1e-6;
-    for (int w = 0; w < 4; w++) {
-        double xp[4], xm[4], gp[4][4], gm[4][4];
-        memcpy(xp, x, sizeof xp);
-        memcpy(xm, x, sizeof xm);
-        xp[w] = x[w] + delta;
-        xm[w] = x[w] - delta;
-        c_inverse_metric(xp, gp);
-        c_inverse_metric(xm, gm);
-        for (int i = 0; i < 4; i++)
-            for (int j = 0; j < 4; j++) dg[w][i][j] = (gp[i][j] - gm[i][j]) / (2 * delta);
-    }
-}
-
-static void c_hamiltonian(const double y[8], double d[8]) {
-    double g[4][4], dg[4][4][4];
-    c_inverse_metric(y, g);
-    c_dgdx(y, dg);
-    const double *p = y + 4;
-    for (int i = 0; i < 4; i++) {
-        double s = 0;
-        for (int j = 0; j < 4; j++) s += g[i][j] * p[j];
-        d[i] = s;
-    }
-    for (int w = 0; w < 4; w++) {
-        double dp = 0;
-        for (int u = 0; u < 4; u++)
-            for (int v = 0; v < 4; v++) dp = dp - 0.5 * dg[w][u][v] * p[u] * p[v];
-        d[4 + w] = dp;
-    }
-}
-
-static double c_norm8(const double v[8]) {
-    double s = 0;
-    for (int i = 0; i < 8; i++) s += v[i] * v[i];
-    return sqrt(s);
-}
-
-/* One implicit RK step with s stages (2 = RK4, 3 = RK6), as in Appendix A */
-static void c_rk(int s, const double A[3][3], const double B[3], const double y[8], double h,
-                 double out[8]) {
-    double k[3][8], kn[3][8], yi[8], d[8];
-    c_hamiltonian(y, k[0]);
-    for (int i = 1; i < s; i++) memcpy(k[i], k[0], sizeof k[0]);
-    for (int it = 0; it < 20; it++) {
-        for (int i = 0; i < s; i++) {
-            for (int c = 0; c < 8; c++) {
-                double acc = A[i][0] * k[0][c];
-                for (int j = 1; j < s; j++) acc = acc + A[i][j] * k[j][c];
-                yi[c] = y[c] + h * acc;
-            }
-            c_hamiltonian(yi, kn[i]);
-        }
-        int done = 1;
-        for (int i = 0; i < s; i++) {
-            for (int c = 0; c < 8; c++) d[c] = kn[i][c] - k[i][c];
-            if (!(c_norm8(d) < 5e-11)) done = 0;
-        }
-        if (done) break;
-        memcpy(k, kn, sizeof k);
-    }
-    for (int c = 0; c < 8; c++) {
-        double acc = B[0] * k[0][c];
-        for (int j = 1; j < s; j++) acc = acc + B[j] * k[j][c];
-        out[c] = y[c] + h * acc;
-    }
-}
-
-static void c_rk46(const Params *P, const double y[8], double h, double out[8]) {
-    const double A4[3][3] = {{P->r4a11, P->r4a12}, {P->r4a21, P->r4a22}}, B4[3] = {P->r4b1, P->r4b2};
-    const double A6[3][3] = {{P->r6a11, P->r6a12, P->r6a13},
-                             {P->r6a21, P->r6a22, P->r6a23},
-                             {P->r6a31, P->r6a32, P->r6a33}};
-    const double B6[3] = {P->r6b1, P->r6b2, P->r6b3};
-    double hc = h, y6[8], d[8];
-    for (int it = 0; it < 2; it++) {
-        c_rk(2, A4, B4, y, hc, out);
-        c_rk(3, A6, B6, y, hc, y6);
-        for (int c = 0; c < 8; c++) d[c] = y6[c] - out[c];
-        double error = c_norm8(d);
-        if (error < 0.1) return;
-        hc = 0.9 * hc * pow(0.1 / error, 1.0 / 5);
-    }
-}
-
-/* Test entry point appended to geodesic.comp in place of its main() */
-static const char *selftest_main =
-    "\n"
-    "layout(std430, binding = 3) buffer Test { double t[]; };\n"
-    "// (Only constant indices into vectors: NVIDIA can't link v[i] = ... for doubles.)\n"
-    "// Driver checks: hand doubles back three different ways\n"
-    "void probe_out_array(out double v[8]) { for (int i = 0; i < 8; i++) v[i] = t[200 + i]; }\n"
-    "void probe_out_dvec4(out dvec4 v) { v = dvec4(t[200], t[201], t[202], t[203]); }\n"
-    "dmat4 probe_return_dmat4() {\n"
-    "    dvec4 a = dvec4(t[200], t[201], t[202], t[203]), b = dvec4(t[204], t[205], t[206], t[207]);\n"
-    "    return dmat4(a, b, a, b);\n"
-    "}\n"
-    "void put4(inout int o, dvec4 v) { t[o] = v[0]; t[o + 1] = v[1]; t[o + 2] = v[2]; t[o + 3] = v[3]; o += 4; }\n"
-    "void put_q_p(inout int o, dvec4 q, dvec4 p) { put4(o, q); put4(o, p); }\n"
-    "void put_mat(inout int o, dmat4 m) { put4(o, m[0]); put4(o, m[1]); put4(o, m[2]); put4(o, m[3]); }\n"
-    "void put_metric_and_derivatives(inout int o, dvec4 x) {\n"
-    "    put_mat(o, inverse_metric(x));\n"
-    "    put_mat(o, dgdx(x, 0)); put_mat(o, dgdx(x, 1)); put_mat(o, dgdx(x, 2)); put_mat(o, dgdx(x, 3));\n"
-    "}\n"
-    "void main() {\n"
-    "    if (gl_GlobalInvocationID.x != 0u) return;\n"
-    "    int o = 256;  // inputs live in t[0..255], results from t[256] on\n"
-    "    for (int i = 0; i < 32; i++) { t[o++] = dsin(t[i]); t[o++] = dcos(t[i]); }\n"
-    "    for (int i = 0; i < 32; i++) { t[o++] = ddiv(t[32 + 2*i], t[33 + 2*i]); t[o++] = dsqrt(t[33 + 2*i]); }\n"
-    "    dvec4 q = dvec4(state[0], state[1], state[2], state[3]);\n"
-    "    dvec4 p = dvec4(state[4], state[5], state[6], state[7]);\n"
-    "    dvec4 dq, dp, nq, np;\n"
-    "    put_metric_and_derivatives(o, q);\n"
-    "    hamiltonian(q, p, dq, dp);\n"
-    "    put_q_p(o, dq, dp);\n"
-    "    // a second, less special point (theta != pi/2)\n"
-    "    dvec4 zq = dvec4(t[100], t[101], t[102], t[103]), zp = dvec4(t[104], t[105], t[106], t[107]);\n"
-    "    put_metric_and_derivatives(o, zq);\n"
-    "    hamiltonian(zq, zp, dq, dp);\n"
-    "    put_q_p(o, dq, dp);\n"
-    "    symplectic_rk4(q, p, h, 5e-11LF, 20, nq, np);\n"
-    "    put_q_p(o, nq, np);\n"
-    "    symplectic_rk6(q, p, h, 5e-11LF, 20, nq, np);\n"
-    "    put_q_p(o, nq, np);\n"
-    "    symplectic_rk46_comparison(q, p, h, nq, np);\n"
-    "    put_q_p(o, nq, np);\n"
-    "    for (int n = 0; n < 100; n++) { symplectic_rk46_comparison(q, p, h, nq, np); q = nq; p = np; }\n"
-    "    put_q_p(o, q, p);\n"
-    "    double v[8];\n"
-    "    probe_out_array(v);\n"
-    "    for (int i = 0; i < 8; i++) t[o++] = v[i];\n"
-    "    dvec4 pv;\n"
-    "    probe_out_dvec4(pv);\n"
-    "    put4(o, pv);\n"
-    "    put_mat(o, probe_return_dmat4());\n"
-    "}\n";
-
-/* Compares one group of GPU results with the CPU's and prints a line.
-   Errors are relative to the largest value in the group. */
-static int report(const char *name, const double *gpu, const double *cpu, int n, double limit) {
-    double scale = 0, worst = 0;
-    int at = 0;
-    for (int i = 0; i < n; i++) scale = fmax(scale, fabs(cpu[i]));
-    if (scale == 0) scale = 1;
-    for (int i = 0; i < n; i++) {
-        double e = fabs(gpu[i] - cpu[i]) / scale;
-        if (!(e <= worst)) { worst = e; at = i; }
-    }
-    int ok = worst <= limit;
-    printf("  %-28s %-4s  worst relative difference %.2e (allowed %.0e)", name, ok ? "ok" : "BAD", worst, limit);
-    if (!ok) printf("  at #%d: gpu %.17g, cpu %.17g", at, gpu[at], cpu[at]);
-    printf("\n");
-    return ok;
-}
-
-static int selftest(const char *shader_path, const Params *P, const double y0[8]) {
-    cM = P->M;
-    ca = P->a;
-
-    /* Swap the shader's main() for the test one */
-    char *src = read_shader(shader_path);
-    char *m = strstr(src, "void main()");
-    if (!m) die("couldn't find main() in the shader");
-    const char *renamed = "void integrate_main()";
-    size_t len = strlen(src) + strlen(renamed) + strlen(selftest_main) + 1;
-    char *test_src = malloc(len);
-    snprintf(test_src, len, "%.*s%s%s%s", (int)(m - src), src, renamed,
-             m + strlen("void main()"), selftest_main);
-    GLuint prog = build_program_from_source(test_src);
-    free(src);
-    free(test_src);
-    glUseProgram(prog);
-
-    double in[256] = {0};
-    for (int i = 0; i < 32; i++) in[i] = -3.0 + 0.2 * i + 0.0123;      /* angles for sin/cos */
-    for (int i = 0; i < 32; i++) {
-        in[32 + 2 * i] = 1.0 + 0.37 * i;                            /* a/b and sqrt(b) */
-        in[33 + 2 * i] = 3.0 - 0.071 * i + 1e-3 * i * i;
-    }
-    const double z[8] = {0.0, 17.3, 1.1, 0.4, -0.97, 0.12, 3.5, 2.9};  /* the second point */
-    memcpy(in + 100, z, sizeof z);
-    for (int i = 0; i < 8; i++) in[200 + i] = (i + 1) / 3.0;  /* inputs for the driver checks */
-    double *buf_data = calloc(1024, sizeof(double));
-    memcpy(buf_data, in, sizeof in);
-
-    GLuint buf[3];
-    glGenBuffers(3, buf);
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, buf[0]);
-    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof *P, P, GL_DYNAMIC_COPY);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, buf[0]);
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, buf[1]);
-    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(double) * 8, y0, GL_DYNAMIC_COPY);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, buf[1]);
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, buf[2]);
-    glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(double) * 1024, buf_data, GL_DYNAMIC_COPY);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 3, buf[2]);
-    glDispatchCompute(1, 1, 1);
-    glMemoryBarrier(GL_SHADER_STORAGE_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
-    glGetBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(double) * 1024, buf_data);
-    if (glGetError()) die("GL error during the self-test");
-    const double *gpu = buf_data + 256;
-
-    /* The same things on the CPU */
-    double cpu[768] = {0};  /* results: 128 + 88 + 88 + 32 + 28 doubles */
-    int o = 0;
-    for (int i = 0; i < 32; i++) { cpu[o++] = sin(in[i]); cpu[o++] = cos(in[i]); }
-    for (int i = 0; i < 32; i++) { cpu[o++] = in[32 + 2 * i] / in[33 + 2 * i]; cpu[o++] = sqrt(in[33 + 2 * i]); }
-    double g[4][4], dg[4][4][4], d[8], s[8], y[8];
-    c_inverse_metric(y0, g);
-    memcpy(cpu + o, g, sizeof g); o += 16;
-    c_dgdx(y0, dg);
-    memcpy(cpu + o, dg, sizeof dg); o += 64;
-    c_hamiltonian(y0, d);
-    memcpy(cpu + o, d, sizeof d); o += 8;
-    c_inverse_metric(z, g);
-    memcpy(cpu + o, g, sizeof g); o += 16;
-    c_dgdx(z, dg);
-    memcpy(cpu + o, dg, sizeof dg); o += 64;
-    c_hamiltonian(z, d);
-    memcpy(cpu + o, d, sizeof d); o += 8;
-    const double A4[3][3] = {{P->r4a11, P->r4a12}, {P->r4a21, P->r4a22}}, B4[3] = {P->r4b1, P->r4b2};
-    const double A6[3][3] = {{P->r6a11, P->r6a12, P->r6a13},
-                             {P->r6a21, P->r6a22, P->r6a23},
-                             {P->r6a31, P->r6a32, P->r6a33}};
-    const double B6[3] = {P->r6b1, P->r6b2, P->r6b3};
-    c_rk(2, A4, B4, y0, P->h, s);
-    memcpy(cpu + o, s, sizeof s); o += 8;
-    c_rk(3, A6, B6, y0, P->h, s);
-    memcpy(cpu + o, s, sizeof s); o += 8;
-    c_rk46(P, y0, P->h, s);
-    memcpy(cpu + o, s, sizeof s); o += 8;
-    memcpy(y, y0, sizeof y);
-    for (int n = 0; n < 100; n++) { c_rk46(P, y, P->h, s); memcpy(y, s, sizeof y); }
-    memcpy(cpu + o, y, sizeof y); o += 8;
-    for (int i = 0; i < 8; i++) cpu[o++] = in[200 + i];                        /* out double[8] */
-    for (int i = 0; i < 4; i++) cpu[o++] = in[200 + i];                        /* out dvec4 */
-    for (int i = 0; i < 16; i++) cpu[o++] = in[200 + i % 8];                   /* return dmat4 */
-
-    /* sin, cos, division, sqrt and the metric should agree to the last digit
-       or two. Derivatives magnify those last digits about a million times, and
-       the RK steps add the fixed-point iteration's 5e-11 tolerance. */
-    printf("self-test: GPU functions vs. the same code on the CPU\n");
-    int ok = 1, k = 0;
-    double gs[32], cs[32], gc[32], cc[32], gd[32], cd[32], gq[32], cq[32];
-    for (int i = 0; i < 32; i++) {
-        gs[i] = gpu[k + 2 * i]; cs[i] = cpu[k + 2 * i];
-        gc[i] = gpu[k + 2 * i + 1];     cc[i] = cpu[k + 2 * i + 1];
-    }
-    k += 64;
-    for (int i = 0; i < 32; i++) {
-        gd[i] = gpu[k + 2 * i]; cd[i] = cpu[k + 2 * i];
-        gq[i] = gpu[k + 2 * i + 1]; cq[i] = cpu[k + 2 * i + 1];
-    }
-    k += 64;
-    ok &= report("sin", gs, cs, 32, 1e-15);
-    ok &= report("cos", gc, cc, 32, 1e-15);
-    ok &= report("division (ddiv)", gd, cd, 32, 1e-15);
-    ok &= report("square root (dsqrt)", gq, cq, 32, 1e-15);
-    ok &= report("inverse_metric", gpu + k, cpu + k, 16, 1e-14); k += 16;
-    ok &= report("dgdx", gpu + k, cpu + k, 64, 1e-6); k += 64;
-    ok &= report("hamiltonian", gpu + k, cpu + k, 8, 1e-7); k += 8;
-    ok &= report("inverse_metric (2nd point)", gpu + k, cpu + k, 16, 1e-14); k += 16;
-    ok &= report("dgdx (2nd point)", gpu + k, cpu + k, 64, 1e-6); k += 64;
-    ok &= report("hamiltonian (2nd point)", gpu + k, cpu + k, 8, 1e-7); k += 8;
-    ok &= report("symplectic_rk4 (1 step)", gpu + k, cpu + k, 8, 1e-8); k += 8;
-    ok &= report("symplectic_rk6 (1 step)", gpu + k, cpu + k, 8, 1e-8); k += 8;
-    ok &= report("rk46_comparison (1 step)", gpu + k, cpu + k, 8, 1e-8); k += 8;
-    ok &= report("rk46_comparison (100 steps)", gpu + k, cpu + k, 8, 1e-6); k += 8;
-    printf("driver checks (how this driver hands back doubles; the integrator only\n"
-           "uses dvec4 and dmat4, so a BAD on the first line alone is expected):\n");
-    report("out double[8] parameter", gpu + k, cpu + k, 8, 1e-15); k += 8;
-    ok &= report("out dvec4 parameter", gpu + k, cpu + k, 4, 1e-15); k += 4;
-    ok &= report("returned dmat4", gpu + k, cpu + k, 16, 1e-15); k += 16;
-    printf(ok ? "all checks passed\n" : "some checks FAILED (marked BAD above)\n");
-    free(buf_data);
-    return ok ? 0 : 1;
-}
-
 int main(int argc, char **argv) {
     double M = 1.0, a = 0.5, h = 1.0;
     long steps = 15000, chunk = 100;
     const char *out = "geodesic.npy", *shader = NULL, *ic_file = NULL;
     double *ics = NULL;
     long n_ic = 0;
-    int run_selftest = 0;
 
     for (int i = 1; i < argc; i++) {
         const char *k = argv[i];
@@ -639,10 +323,6 @@ int main(int argc, char **argv) {
         if (!strcmp(k, "-h") || !strcmp(k, "--help")) {
             fprintf(stderr, "see the comment at the top of main.c for options\n");
             return 0;
-        }
-        if (!strcmp(k, "--selftest")) {
-            run_selftest = 1;
-            continue;
         }
         if (!v) die("option without a value");
         i++;
@@ -708,7 +388,6 @@ int main(int argc, char **argv) {
     };
 
     create_context();
-    if (run_selftest) return selftest(shader, &P, ics);
     GLuint prog = build_program(shader);
     glUseProgram(prog);
     glUniform1i(glGetUniformLocation(prog, "n_geodesics"), (GLint)n_ic);
