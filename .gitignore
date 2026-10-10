@@ -15,3 +15,7 @@ figures/
 # Include the reference figures
 !fig6a_schwarzschild_bernard.png
 !fig7a_kerr_bernard.png
+
+# Fortran build output
+fortran/geodesic
+*.mod
