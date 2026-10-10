@@ -132,6 +132,13 @@ results:
 - GLSL has no double precision `sin`, `cos` or `pow`, so the shader has its
   own. `sin` and `cos` follow FreeBSD's libm. The step-size update needs
   `(tol/error)**(1/5)`, which is computed with Newton's method.
+- Division and square roots are done by hand too (`ddiv` and `dsqrt`). GLSL
+  only promises they're as accurate as single precision, and NVIDIA's driver
+  uses a fast approximate division. That wrecks the finite differences in
+  `dgdx` (the metric at `r ± 1e-6` comes out the same), and on the L40S the
+  orbits flew off in a straight line. The shader now starts from a single
+  precision guess and refines it with Newton's method using `fma`, which gives
+  exactly rounded double division on any GPU.
 - Python calls `f(y)` two or three times for the starting guesses. The shader
   calls it once and copies the result, since the answer is always the same.
 - The 15,000 steps are split across several GPU dispatches (`--chunk`, 100 by

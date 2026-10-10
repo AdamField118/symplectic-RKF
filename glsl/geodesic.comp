@@ -42,6 +42,38 @@ layout(std430, binding = 2) writeonly buffer Traj {
 uniform int n_geodesics;
 uniform int chunk;          // how many steps this dispatch takes
 
+// Double precision division and square root, done by hand.
+//
+// GLSL only promises that double division and sqrt are as accurate as single
+// precision, and NVIDIA's driver takes it up on that. That's fine for most
+// things, but it ruins the finite differences in dgdx(): g(r + 1e-6) and
+// g(r - 1e-6) come out the same, the derivatives go to zero, and the orbit
+// flies off in a straight line. So we start from a single precision guess and
+// fix it up with Newton steps, using only +, * and fma, which are exact
+// double operations on every GPU. (fma only counts as one exact operation
+// when its result goes into a `precise` variable, hence all the `precise`.)
+double ddiv(double a, double b) {
+    precise double y = double(1.0 / float(b));  // ~7 correct digits
+    precise double e = fma(-b, y, 1.0LF);       // two Newton steps take 1/b
+    y = fma(e, y, y);                           // to full double precision
+    e = fma(-b, y, 1.0LF);
+    y = fma(e, y, y);
+    precise double q = a * y;
+    precise double r = fma(-b, q, a);           // and one more corrects the
+    precise double result = fma(r, y, q);       // last digit of a/b
+    return result;
+}
+
+double dsqrt(double x) {
+    if (!(x > 0.0LF)) return sqrt(x);           // 0, negatives and NaN as is
+    precise double y = double(sqrt(float(x)));
+    for (int i = 0; i < 2; i++) {               // Newton: y += (x - y^2) / 2y
+        precise double r = fma(-y, y, x);
+        y = fma(r, ddiv(0.5LF, y), y);
+    }
+    return y;
+}
+
 // Double precision sin and cos, from FreeBSD's libm (k_sin.c, k_cos.c and the
 // medium-size path of e_rem_pio2.c). The `precise` qualifiers keep the
 // compiler from fusing multiplies and adds, since the error-correcting sums
@@ -154,7 +186,7 @@ double fifth_root(double x) {
     double y = double(pow(float(m), 0.2));  // ~1e-7 relative
     for (int i = 0; i < 3; i++) {           // Newton steps on y^5 = m
         double y4 = y * y * y * y;
-        y = y - (y4 * y - m) / (5.0LF * y4);
+        y = y - ddiv(y4 * y - m, 5.0LF * y4);
     }
     return ldexp(y, q);
 }
@@ -178,25 +210,25 @@ void inverse_metric(double x[4], out double g[4][4]) {
     double sin_theta = dsin(theta);
 
     //Input all the spacetime metric components (Kerr for this example)
-    g[0][0] = -((r*r + a*a)*(r*r + a*a) - (a*a) * Delta * (sin_theta*sin_theta)) / (Delta * Sigma);
+    g[0][0] = ddiv(-((r*r + a*a)*(r*r + a*a) - (a*a) * Delta * (sin_theta*sin_theta)), Delta * Sigma);
     g[0][1] = 0.0LF;
     g[0][2] = 0.0LF;
-    g[0][3] = -2.0LF * M * a * r / (Delta * Sigma);
+    g[0][3] = ddiv(-2.0LF * M * a * r, Delta * Sigma);
 
     g[1][0] = g[0][1];
-    g[1][1] = Delta / Sigma;
+    g[1][1] = ddiv(Delta, Sigma);
     g[1][2] = 0.0LF;
     g[1][3] = 0.0LF;
 
     g[2][0] = g[0][2];
     g[2][1] = g[1][2];
-    g[2][2] = 1.0LF / Sigma;
+    g[2][2] = ddiv(1.0LF, Sigma);
     g[2][3] = 0.0LF;
 
     g[3][0] = g[0][3];
     g[3][1] = g[1][3];
     g[3][2] = g[2][3];
-    g[3][3] = (Delta - (a*a) * (sin_theta*sin_theta)) / (Delta * Sigma * (sin_theta*sin_theta));
+    g[3][3] = ddiv(Delta - (a*a) * (sin_theta*sin_theta), Delta * Sigma * (sin_theta*sin_theta));
 }
 
 // Numerical derivatives of inverse metric
@@ -216,7 +248,7 @@ void dgdx(double x[4], out double dg[4][4][4]) {
         inverse_metric(x_minus, g_minus);
         for (int i = 0; i < 4; i++)
             for (int j = 0; j < 4; j++)
-                dg[w][i][j] = (g_plus[i][j] - g_minus[i][j]) / (2.0LF * delta);
+                dg[w][i][j] = ddiv(g_plus[i][j] - g_minus[i][j], 2.0LF * delta);
     }
 }
 
@@ -255,7 +287,7 @@ void hamiltonian(double y[8], out double dydt[8]) {
 double norm8(double v[8]) {
     double s = 0.0LF;
     for (int i = 0; i < 8; i++) s += v[i] * v[i];
-    return sqrt(s);
+    return dsqrt(s);
 }
 
 // Symplectic RK4 step, uses fixed point iteration to solve the implicit RK method
@@ -372,7 +404,7 @@ void symplectic_rk46_comparison(double y[8], double h, out double y_rk4[8]) {
         }
 
         // Update step size using formula that's used in the rkf method
-        h_current = 0.9LF * h_current * fifth_root(tol / error);
+        h_current = 0.9LF * h_current * fifth_root(ddiv(tol, error));
     }
 
     // If the error still isn't below the tolerance after max_shrinks, accept the rk4 step
