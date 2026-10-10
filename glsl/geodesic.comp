@@ -192,19 +192,21 @@ double fifth_root(double x) {
 }
 
 // From here on it's Appendix A.
-
-// The metric and its derivatives are kept in flat arrays: g[G(i, j)] is
-// g[i, j] in the Python and dg[DG(w, i, j)] is dg[w, i, j]. NVIDIA's driver
-// (595.71) stores double arrays of arrays, like double g[4][4], at single
-// precision, which wrecks the finite differences in dgdx(). Flat double
-// arrays keep their full precision.
-int G(int i, int j) { return 4 * i + j; }
-int DG(int w, int i, int j) { return 16 * w + 4 * i + j; }
+//
+// Positions and momenta are kept as two dvec4s, q = (t, r, theta, phi) and
+// p = (p_t, p_r, p_theta, p_phi), and the metric as a dmat4, instead of double
+// arrays. NVIDIA's driver (595.71) passes double arrays back out of functions
+// at single precision, which wrecked the finite differences in dgdx(). Its
+// compiler also can't write to a component of a double vector picked by a
+// variable (v[i] = ... fails to link), so every index below is a fixed number
+// and vectors are built whole. The arithmetic is the same as before,
+// component by component. The metric is symmetric, so g[i][j] means the same
+// thing whichever index GLSL treats as the column.
 
 // Inverse Kerr metric (uses the inverse metric like the Fantasty code). Takes in
 //a vector of length 4 representing the 4 Boyder-Lindquist coordinates: t, r,
 //theta, and phi
-void inverse_metric(double x[4], out double g[16]) {
+dmat4 inverse_metric(dvec4 x) {
 
     double t = x[0];
     double r = x[1];
@@ -217,170 +219,196 @@ void inverse_metric(double x[4], out double g[16]) {
     double Delta = r*r - 2.0LF*M*r + a*a;
     double sin_theta = dsin(theta);
 
+    //Set up a 4x4 matrix of zeroes
+    dmat4 g = dmat4(0.0LF);
+
     //Input all the spacetime metric components (Kerr for this example)
-    g[G(0, 0)] = ddiv(-((r*r + a*a)*(r*r + a*a) - (a*a) * Delta * (sin_theta*sin_theta)), Delta * Sigma);
-    g[G(0, 1)] = 0.0LF;
-    g[G(0, 2)] = 0.0LF;
-    g[G(0, 3)] = ddiv(-2.0LF * M * a * r, Delta * Sigma);
+    g[0][0] = ddiv(-((r*r + a*a)*(r*r + a*a) - (a*a) * Delta * (sin_theta*sin_theta)), Delta * Sigma);
+    g[0][1] = 0.0LF;
+    g[0][2] = 0.0LF;
+    g[0][3] = ddiv(-2.0LF * M * a * r, Delta * Sigma);
 
-    g[G(1, 0)] = g[G(0, 1)];
-    g[G(1, 1)] = ddiv(Delta, Sigma);
-    g[G(1, 2)] = 0.0LF;
-    g[G(1, 3)] = 0.0LF;
+    g[1][0] = g[0][1];
+    g[1][1] = ddiv(Delta, Sigma);
+    g[1][2] = 0.0LF;
+    g[1][3] = 0.0LF;
 
-    g[G(2, 0)] = g[G(0, 2)];
-    g[G(2, 1)] = g[G(1, 2)];
-    g[G(2, 2)] = ddiv(1.0LF, Sigma);
-    g[G(2, 3)] = 0.0LF;
+    g[2][0] = g[0][2];
+    g[2][1] = g[1][2];
+    g[2][2] = ddiv(1.0LF, Sigma);
+    g[2][3] = 0.0LF;
 
-    g[G(3, 0)] = g[G(0, 3)];
-    g[G(3, 1)] = g[G(1, 3)];
-    g[G(3, 2)] = g[G(2, 3)];
-    g[G(3, 3)] = ddiv(Delta - (a*a) * (sin_theta*sin_theta), Delta * Sigma * (sin_theta*sin_theta));
+    g[3][0] = g[0][3];
+    g[3][1] = g[1][3];
+    g[3][2] = g[2][3];
+    g[3][3] = ddiv(Delta - (a*a) * (sin_theta*sin_theta), Delta * Sigma * (sin_theta*sin_theta));
+
+    return g;
 }
 
 // Numerical derivatives of inverse metric
-void dgdx(double x[4], out double dg[64]) {
+// (Python returns all four derivatives at once as dg[0..3]; this returns dg[w],
+// the derivatives with respect to coordinate w, and hamiltonian() asks for
+// each w in turn. Same numbers, no arrays.)
+dvec4 ddiv4(dvec4 v, double b) {
+    return dvec4(ddiv(v[0], b), ddiv(v[1], b), ddiv(v[2], b), ddiv(v[3], b));
+}
+
+dmat4 dgdx(dvec4 x, int w) {
     const double delta = 1e-6LF;
 
     // Uses central finite differences to approximate each partial derivative.
     //The n-th loop computes all 4 partial derivatives for the n-th spacetime
     //coordinate.
-    for (int w = 0; w < 4; w++) {
-        double x_plus[4] = x;
-        double x_minus[4] = x;
-        x_plus[w] = x[w] + delta;
-        x_minus[w] = x[w] - delta;
-        double g_plus[16], g_minus[16];
-        inverse_metric(x_plus, g_plus);
-        inverse_metric(x_minus, g_minus);
-        for (int i = 0; i < 4; i++)
-            for (int j = 0; j < 4; j++)
-                dg[DG(w, i, j)] = ddiv(g_plus[G(i, j)] - g_minus[G(i, j)], 2.0LF * delta);
-    }
+    dvec4 dx = dvec4(w == 0 ? delta : 0.0LF, w == 1 ? delta : 0.0LF,
+                     w == 2 ? delta : 0.0LF, w == 3 ? delta : 0.0LF);
+    dmat4 g_plus = inverse_metric(x + dx);
+    dmat4 g_minus = inverse_metric(x - dx);
+    return dmat4(ddiv4(g_plus[0] - g_minus[0], 2.0LF * delta),
+                 ddiv4(g_plus[1] - g_minus[1], 2.0LF * delta),
+                 ddiv4(g_plus[2] - g_minus[2], 2.0LF * delta),
+                 ddiv4(g_plus[3] - g_minus[3], 2.0LF * delta));
+}
+
+// g[i][0]*p[0] + ... + g[i][3]*p[3], added up in that order
+double row_times(dvec4 gi, dvec4 p) {
+    double s = 0.0LF;
+    s += gi[0] * p[0];
+    s += gi[1] * p[1];
+    s += gi[2] * p[2];
+    s += gi[3] * p[3];
+    return s;
+}
+
+// The inner two loops of the momentum sum for one index w, in the same order:
+// d = d - 0.5 * dg[w, u, v] * p[u] * p[v] for u, v = 0..3
+double momentum_sum(dmat4 dg, dvec4 p) {
+    double d = 0.0LF;
+    d = d - 0.5LF * dg[0][0] * p[0] * p[0];
+    d = d - 0.5LF * dg[0][1] * p[0] * p[1];
+    d = d - 0.5LF * dg[0][2] * p[0] * p[2];
+    d = d - 0.5LF * dg[0][3] * p[0] * p[3];
+    d = d - 0.5LF * dg[1][0] * p[1] * p[0];
+    d = d - 0.5LF * dg[1][1] * p[1] * p[1];
+    d = d - 0.5LF * dg[1][2] * p[1] * p[2];
+    d = d - 0.5LF * dg[1][3] * p[1] * p[3];
+    d = d - 0.5LF * dg[2][0] * p[2] * p[0];
+    d = d - 0.5LF * dg[2][1] * p[2] * p[1];
+    d = d - 0.5LF * dg[2][2] * p[2] * p[2];
+    d = d - 0.5LF * dg[2][3] * p[2] * p[3];
+    d = d - 0.5LF * dg[3][0] * p[3] * p[0];
+    d = d - 0.5LF * dg[3][1] * p[3] * p[1];
+    d = d - 0.5LF * dg[3][2] * p[3] * p[2];
+    d = d - 0.5LF * dg[3][3] * p[3] * p[3];
+    return d;
 }
 
 // Hamiltonian
-void hamiltonian(double y[8], out double dydt[8]) {
+void hamiltonian(dvec4 x, dvec4 p, out dvec4 dx, out dvec4 dp) {
     // Takes the first n elements of the initial conditions vector y (these
     //correspond to the position coordinates) and the last n elements of y (these
     //correspond to the momentum coordinates), and makes them their own vectors.
-    double x[4] = double[4](y[0], y[1], y[2], y[3]);
-    double p[4] = double[4](y[4], y[5], y[6], y[7]);
+    // (Here they already arrive as the two vectors x and p.)
 
-    double g[16];
-    double dg[64];
-    inverse_metric(x, g);
-    dgdx(x, dg);
+    dmat4 g = inverse_metric(x);
 
     // Following the Hamiltonian equations for geodesics, we calculate the
     //derivatives of the position and momentum components
-    for (int i = 0; i < 4; i++) {
-        double s = 0.0LF;
-        for (int j = 0; j < 4; j++) s += g[G(i, j)] * p[j];
-        dydt[i] = s;
-    }
+    dx = dvec4(row_times(g[0], p), row_times(g[1], p), row_times(g[2], p), row_times(g[3], p));
 
     // Uses a triple for-loop to sum over the 3 indices in the equation for the
     //momentum derivative
-    for (int w = 0; w < 4; w++) {
-        double dp = 0.0LF;
-        for (int u = 0; u < 4; u++)
-            for (int v = 0; v < 4; v++)
-                dp = dp - 0.5LF * dg[DG(w, u, v)] * p[u] * p[v];
-        dydt[4 + w] = dp;
-    }
+    // (written out as momentum_sum() below, one call per index w)
+    dp = dvec4(momentum_sum(dgdx(x, 0), p), momentum_sum(dgdx(x, 1), p),
+               momentum_sum(dgdx(x, 2), p), momentum_sum(dgdx(x, 3), p));
 }
 
-double norm8(double v[8]) {
+// The 2-norm of the 8-vector (a, b)
+double norm8(dvec4 a, dvec4 b) {
     double s = 0.0LF;
-    for (int i = 0; i < 8; i++) s += v[i] * v[i];
+    s += a[0] * a[0];
+    s += a[1] * a[1];
+    s += a[2] * a[2];
+    s += a[3] * a[3];
+    s += b[0] * b[0];
+    s += b[1] * b[1];
+    s += b[2] * b[2];
+    s += b[3] * b[3];
     return dsqrt(s);
 }
 
 // Symplectic RK4 step, uses fixed point iteration to solve the implicit RK method
-void symplectic_rk4(double y[8], double h, double tol, int max_iter, out double y_next[8]) {
+void symplectic_rk4(dvec4 q, dvec4 p, double h, double tol, int max_iter,
+                    out dvec4 q_next, out dvec4 p_next) {
     // Gives the initial guess for k1 and k2 based on the input
-    double k1[8], k2[8];
-    hamiltonian(y, k1);
-    k2 = k1;  // f(y) gives the same answer every time, so call it once
+    dvec4 k1q, k1p;
+    hamiltonian(q, p, k1q, k1p);
+    dvec4 k2q = k1q, k2p = k1p;  // f(y) gives the same answer every time, so call it once
 
     // Updates k1 and k2 based on the symplectic rk4 coefficients and the previous
     //guess for k1 and k2.
     for (int it = 0; it < max_iter; it++) {
-        double y1[8], y2[8], k1_new[8], k2_new[8];
-        for (int i = 0; i < 8; i++) {
-            y1[i] = y[i] + h * (r4a11 * k1[i] + r4a12 * k2[i]);
-            y2[i] = y[i] + h * (r4a21 * k1[i] + r4a22 * k2[i]);
-        }
-        hamiltonian(y1, k1_new);
-        hamiltonian(y2, k2_new);
+        dvec4 k1q_new, k1p_new, k2q_new, k2p_new;
+        hamiltonian(q + h * (r4a11 * k1q + r4a12 * k2q), p + h * (r4a11 * k1p + r4a12 * k2p), k1q_new, k1p_new);
+        hamiltonian(q + h * (r4a21 * k1q + r4a22 * k2q), p + h * (r4a21 * k1p + r4a22 * k2p), k2q_new, k2p_new);
 
         // Checks if the difference (in the regular 2-norm) of k1 and the updated
         //k1 is less than the given tolerance, and if the same is true for k2 and
         //the updated k2.
-        double d1[8], d2[8];
-        for (int i = 0; i < 8; i++) { d1[i] = k1_new[i] - k1[i]; d2[i] = k2_new[i] - k2[i]; }
-        if ((norm8(d1) < tol) && (norm8(d2) < tol)) {
+        if ((norm8(k1q_new - k1q, k1p_new - k1p) < tol) && (norm8(k2q_new - k2q, k2p_new - k2p) < tol)) {
             break;
         }
 
         // Replaces the previous guess with the new one
-        k1 = k1_new;
-        k2 = k2_new;
+        k1q = k1q_new; k1p = k1p_new;
+        k2q = k2q_new; k2p = k2p_new;
     }
 
     // Uses the final guesses and the symplectic rk4 coefficients to update y.
-    for (int i = 0; i < 8; i++) y_next[i] = y[i] + h * (r4b1 * k1[i] + r4b2 * k2[i]);
+    q_next = q + h * (r4b1 * k1q + r4b2 * k2q);
+    p_next = p + h * (r4b1 * k1p + r4b2 * k2p);
 }
 
 // Symplectic RK6 step, uses fixed point iteration to solve the implicit RK method
-void symplectic_rk6(double y[8], double h, double tol, int max_iter, out double y_next[8]) {
+void symplectic_rk6(dvec4 q, dvec4 p, double h, double tol, int max_iter,
+                    out dvec4 q_next, out dvec4 p_next) {
     // Gives the initial guess for k1, k2, and k3 based on the input
-    double k1[8], k2[8], k3[8];
-    hamiltonian(y, k1);
-    k2 = k1;  // f(y) gives the same answer every time, so call it once
-    k3 = k1;
+    dvec4 k1q, k1p;
+    hamiltonian(q, p, k1q, k1p);
+    dvec4 k2q = k1q, k2p = k1p;  // f(y) gives the same answer every time, so call it once
+    dvec4 k3q = k1q, k3p = k1p;
 
     // Checks if the difference (in the regular 2-norm) of k1 and the updated
     //k1 is less than the given tolerance, and if the same is true for k2 and
     //the updated k2, and k3 and the updated k3.
     for (int it = 0; it < max_iter; it++) {
-        double y1[8], y2[8], y3[8], k1_new[8], k2_new[8], k3_new[8];
-        for (int i = 0; i < 8; i++) {
-            y1[i] = y[i] + h * (r6a11*k1[i] + r6a12*k2[i] + r6a13*k3[i]);
-            y2[i] = y[i] + h * (r6a21*k1[i] + r6a22*k2[i] + r6a23*k3[i]);
-            y3[i] = y[i] + h * (r6a31*k1[i] + r6a32*k2[i] + r6a33*k3[i]);
-        }
-        hamiltonian(y1, k1_new);
-        hamiltonian(y2, k2_new);
-        hamiltonian(y3, k3_new);
+        dvec4 k1q_new, k1p_new, k2q_new, k2p_new, k3q_new, k3p_new;
+        hamiltonian(q + h * (r6a11*k1q + r6a12*k2q + r6a13*k3q), p + h * (r6a11*k1p + r6a12*k2p + r6a13*k3p), k1q_new, k1p_new);
+        hamiltonian(q + h * (r6a21*k1q + r6a22*k2q + r6a23*k3q), p + h * (r6a21*k1p + r6a22*k2p + r6a23*k3p), k2q_new, k2p_new);
+        hamiltonian(q + h * (r6a31*k1q + r6a32*k2q + r6a33*k3q), p + h * (r6a31*k1p + r6a32*k2p + r6a33*k3p), k3q_new, k3p_new);
 
         // Convergence check (2-norm)
-        double d1[8], d2[8], d3[8];
-        for (int i = 0; i < 8; i++) {
-            d1[i] = k1_new[i] - k1[i]; d2[i] = k2_new[i] - k2[i]; d3[i] = k3_new[i] - k3[i];
-        }
-        if (norm8(d1) < tol &&
-            norm8(d2) < tol &&
-            norm8(d3) < tol) {
+        if (norm8(k1q_new - k1q, k1p_new - k1p) < tol &&
+            norm8(k2q_new - k2q, k2p_new - k2p) < tol &&
+            norm8(k3q_new - k3q, k3p_new - k3p) < tol) {
             break;
         }
 
         // Replaces the previous guess with the new one
-        k1 = k1_new;
-        k2 = k2_new;
-        k3 = k3_new;
+        k1q = k1q_new; k1p = k1p_new;
+        k2q = k2q_new; k2p = k2p_new;
+        k3q = k3q_new; k3p = k3p_new;
     }
 
     // Uses the final guesses and the symplectic rk6 coefficients to update y.
-    for (int i = 0; i < 8; i++) y_next[i] = y[i] + h * (r6b1*k1[i] + r6b2*k2[i] + r6b3*k3[i]);
+    q_next = q + h * (r6b1*k1q + r6b2*k2q + r6b3*k3q);
+    p_next = p + h * (r6b1*k1p + r6b2*k2p + r6b3*k3p);
 }
 
 // We'll compute an rk4 and an rk6 step, find the error between them, and decide
 //whether to accept the rk4 step, or shrink the step size and try again until the
 //error is less than a given tolerance.
-void symplectic_rk46_comparison(double y[8], double h, out double y_rk4[8]) {
+void symplectic_rk46_comparison(dvec4 q, dvec4 p, double h, out dvec4 q_rk4, out dvec4 p_rk4) {
     const double tol = 0.1LF;
     const int max_shrinks = 1;
     const double rk_tol = 5e-11LF;
@@ -395,16 +423,14 @@ void symplectic_rk46_comparison(double y[8], double h, out double y_rk4[8]) {
     for (int it = 0; it < max_shrinks + 1; it++) {
 
         // Compute a symplectic rk4 step
-        symplectic_rk4(y, h_current, rk_tol, rk_max_iter, y_rk4);
+        symplectic_rk4(q, p, h_current, rk_tol, rk_max_iter, q_rk4, p_rk4);
 
         // Compute a symplectic rk6 step
-        double y_rk6[8];
-        symplectic_rk6(y, h_current, rk_tol, rk_max_iter, y_rk6);
+        dvec4 q_rk6, p_rk6;
+        symplectic_rk6(q, p, h_current, rk_tol, rk_max_iter, q_rk6, p_rk6);
 
         // Find the 2 norm of their difference
-        double d[8];
-        for (int i = 0; i < 8; i++) d[i] = y_rk6[i] - y_rk4[i];
-        double error = norm8(d);
+        double error = norm8(q_rk6 - q_rk4, p_rk6 - p_rk4);
 
         // Accept symplectic rk4 step if error is below the tolerance
         if (error < tol) {
@@ -418,22 +444,28 @@ void symplectic_rk46_comparison(double y[8], double h, out double y_rk4[8]) {
     // If the error still isn't below the tolerance after max_shrinks, accept the rk4 step
 }
 
+// Store q and p as 8 consecutive doubles in a buffer
+#define write8(buf, at, q, p) \
+    buf[(at) + 0] = q[0]; buf[(at) + 1] = q[1]; buf[(at) + 2] = q[2]; buf[(at) + 3] = q[3]; \
+    buf[(at) + 4] = p[0]; buf[(at) + 5] = p[1]; buf[(at) + 6] = p[2]; buf[(at) + 7] = p[3];
+
 // Integrate Geodesic (just this dispatch's share of the steps)
 void main() {
     int gid = int(gl_GlobalInvocationID.x);
     if (gid >= n_geodesics) return;
 
-    double y[8];
-    for (int i = 0; i < 8; i++) y[i] = state[gid * 8 + i];
+    dvec4 q = dvec4(state[gid * 8 + 0], state[gid * 8 + 1], state[gid * 8 + 2], state[gid * 8 + 3]);
+    dvec4 p = dvec4(state[gid * 8 + 4], state[gid * 8 + 5], state[gid * 8 + 6], state[gid * 8 + 7]);
 
     // Compute the position/momentum vector using the symplectic rk4, adds it to the
     //trajectory list, and then computes the next position/momentum in the geodesic
     for (int s = 0; s < chunk; s++) {
-        double y_new[8];
-        symplectic_rk46_comparison(y, h, y_new);
-        y = y_new;
-        for (int i = 0; i < 8; i++) traj[(gid * chunk + s) * 8 + i] = y[i];
+        dvec4 q_new, p_new;
+        symplectic_rk46_comparison(q, p, h, q_new, p_new);
+        q = q_new;
+        p = p_new;
+        write8(traj, (gid * chunk + s) * 8, q, p);
     }
 
-    for (int i = 0; i < 8; i++) state[gid * 8 + i] = y[i];
+    write8(state, gid * 8, q, p);
 }

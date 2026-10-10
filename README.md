@@ -88,6 +88,11 @@ python plot_figures.py --kerr results/kerr_glsl.npy --outdir figures/glsl
 With the environment active, the program finds `libEGL.so.1` in it on its
 own. `EGL_LIBRARY=/path/to/libEGL.so.1` points it at a different one.
 
+`./glsl/geodesic --selftest` runs the shader's functions on the GPU (sin, cos,
+division, the metric, its derivatives, the RK steps) and checks each against
+the same code in plain C on the CPU. The batch job runs it first, so if a GPU
+ever gets something wrong, the log says which function.
+
 `./glsl/geodesic` with no options runs Appendix A's Kerr case. The options are
 `--M`, `--a`, `--h`, `--steps`, `--ic "t r theta phi p_t p_r p_theta p_phi"`
 (repeat it for more geodesics), `--ic-file` (one initial condition per line),
