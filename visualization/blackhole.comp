@@ -1,0 +1,489 @@
+#version 430 core
+// Kerr black hole ray tracer. Every pixel is a light ray traced backwards
+// from the camera with Bernard Ymeri's symplectic RK4/RK6 comparison
+// integrator (WPI MQP 2026, Appendix A); see ../glsl/geodesic.comp for the
+// line-by-line port. The accretion disk and starfield are from blackhole-bg.
+//
+// Differences from Appendix A, all for speed:
+//   - Single precision. GPUs run float 32 to 64 times faster than double.
+//   - The derivatives of the inverse metric are the exact formulas instead of
+//     finite differences (Appendix A's dgdx). With delta = 1e-6, r + delta
+//     equals r in single precision, and the exact formulas need one metric
+//     evaluation instead of eight.
+//   - The tolerances are larger, since single precision can't reach 5e-11.
+//   - h isn't fixed: each step starts from h = step * r (smaller still near
+//     the spin axis), so rays take small steps near the hole and big ones far
+//     away. rk46_comparison then works as Appendix A's does, except that a
+//     step so big the error comes out infinite is cut to a quarter.
+//
+// Coordinates are Boyer-Lindquist (t, r, theta, phi) with the spin along z.
+// The state of a ray is the position x = (t, r, theta, phi) and the momentum
+// p = (p_t, p_r, p_theta, p_phi), as in Appendix A.
+layout(local_size_x = 8, local_size_y = 8) in;
+layout(rgba8, binding = 0) uniform writeonly image2D outImage;
+
+uniform sampler2D starTex;
+uniform float M;
+uniform float a;
+uniform vec3 camera;        // (r, theta, phi) of the camera
+uniform float tanHalfFov;
+uniform float aspect;
+uniform int rowOffset;      // the frame is drawn in bands of rows
+uniform int maxSteps;
+uniform float stepScale;    // h = stepScale * r at the start of each step
+uniform float tol;          // rk46_comparison tolerance
+uniform float rkTol;        // fixed-point iteration tolerance
+uniform int rkMaxIter;
+uniform float rHorizon;     // outer event horizon
+uniform float rCapture;     // innermost photon orbit
+uniform float rEscape;      // rays moving outward past this have escaped
+uniform float diskInner;    // innermost stable circular orbit
+uniform float diskOuter;
+uniform float time;         // coordinate time of this frame, in units of M
+uniform bool diskEnabled;
+uniform bool doppler;
+
+const float PI = 3.141592653589793;
+
+// The state of a ray, or a derivative of one
+struct State {
+    vec4 x;
+    vec4 p;
+};
+
+State add(State u, State v) { return State(u.x + v.x, u.p + v.p); }
+State scale(float s, State u) { return State(s * u.x, s * u.p); }
+float norm(State u) { return sqrt(dot(u.x, u.x) + dot(u.p, u.p)); }
+
+
+// Hamiltonian
+// Appendix A's inverse_metric, dgdx and hamiltonian in one. The Kerr metric
+// only depends on r and theta, so only those two derivatives are non-zero
+// (Appendix A's finite differences give exactly zero for t and phi too).
+State hamiltonian(State y) {
+    float r = y.x.y;
+    float s = sin(y.x.z);
+    float c = cos(y.x.z);
+    float s2 = s * s;
+    float a2 = a * a;
+
+    //Making it easier and more compact to write out the full Kerr metric
+    float Sigma = r * r + a2 * c * c;
+    float Delta = r * r - 2.0 * M * r + a2;
+
+    // The pieces of the inverse metric and their r and theta derivatives
+    float Sigma_r = 2.0 * r;
+    float Sigma_th = -2.0 * a2 * s * c;
+    float Delta_r = 2.0 * r - 2.0 * M;
+    float D = Delta * Sigma;
+    float D_r = Delta_r * Sigma + Delta * Sigma_r;
+    float D_th = Delta * Sigma_th;
+    float A = (r * r + a2) * (r * r + a2) - a2 * Delta * s2;
+    float A_r = 4.0 * r * (r * r + a2) - a2 * Delta_r * s2;
+    float A_th = -2.0 * a2 * Delta * s * c;
+    float B = Delta - a2 * s2;
+    float B_th = -2.0 * a2 * s * c;
+    float E = D * s2;
+    float E_r = D_r * s2;
+    float E_th = D_th * s2 + 2.0 * D * s * c;
+
+    // The non-zero components of the inverse metric
+    float gtt = -A / D;
+    float gtp = -2.0 * M * a * r / D;
+    float grr = Delta / Sigma;
+    float gthth = 1.0 / Sigma;
+    float gpp = B / E;
+
+    // and their derivatives with respect to r and theta
+    float gtt_r = -(A_r * D - A * D_r) / (D * D);
+    float gtt_th = -(A_th * D - A * D_th) / (D * D);
+    float gtp_r = -2.0 * M * a * (D - r * D_r) / (D * D);
+    float gtp_th = 2.0 * M * a * r * D_th / (D * D);
+    float grr_r = (Delta_r * Sigma - Delta * Sigma_r) / (Sigma * Sigma);
+    float grr_th = -Delta * Sigma_th / (Sigma * Sigma);
+    float gthth_r = -Sigma_r / (Sigma * Sigma);
+    float gthth_th = -Sigma_th / (Sigma * Sigma);
+    float gpp_r = (Delta_r * E - B * E_r) / (E * E);
+    float gpp_th = (B_th * E - B * E_th) / (E * E);
+
+    vec4 p = y.p;
+
+    // Following the Hamiltonian equations for geodesics, we calculate the
+    //derivatives of the position and momentum components
+    vec4 dx = vec4(gtt * p.x + gtp * p.w,
+                   grr * p.y,
+                   gthth * p.z,
+                   gtp * p.x + gpp * p.w);
+
+    // dp_w = -1/2 sum over u, v of dg[w, u, v] p_u p_v
+    float dpr = -0.5 * (gtt_r * p.x * p.x + 2.0 * gtp_r * p.x * p.w + grr_r * p.y * p.y
+                        + gthth_r * p.z * p.z + gpp_r * p.w * p.w);
+    float dpth = -0.5 * (gtt_th * p.x * p.x + 2.0 * gtp_th * p.x * p.w + grr_th * p.y * p.y
+                         + gthth_th * p.z * p.z + gpp_th * p.w * p.w);
+
+    return State(dx, vec4(0.0, dpr, dpth, 0.0));
+}
+
+
+// Symplectic RK4 coefficients
+const float r4a11 = 1.0/4.0;
+const float r4a12 = 1.0/4.0 - 0.28867513459481287;   // sqrt(3)/6
+const float r4a21 = 1.0/4.0 + 0.28867513459481287;
+const float r4a22 = 1.0/4.0;
+
+const float r4b1 = 1.0/2.0;
+const float r4b2 = 1.0/2.0;
+
+
+// Symplectic RK4 step, uses fixed point iteration to solve the implicit RK method
+// (f0 is f(y), which Appendix A computes at the top of the function)
+State symplectic_rk4(State y, State f0, float h) {
+    // Gives the initial guess for k1 and k2 based on the input
+    State k1 = f0;
+    State k2 = f0;
+
+    // Updates k1 and k2 based on the symplectic rk4 coefficients and the previous
+    //guess for k1 and k2.
+    for (int i = 0; i < rkMaxIter; i++) {
+        State k1_new = hamiltonian(add(y, scale(h, add(scale(r4a11, k1), scale(r4a12, k2)))));
+        State k2_new = hamiltonian(add(y, scale(h, add(scale(r4a21, k1), scale(r4a22, k2)))));
+
+        // Checks if the difference (in the regular 2-norm) of k1 and the updated
+        //k1 is less than the given tolerance, and if the same is true for k2 and
+        //the updated k2.
+        if (norm(add(k1_new, scale(-1.0, k1))) < rkTol && norm(add(k2_new, scale(-1.0, k2))) < rkTol)
+            break;
+
+        // Replaces the previous guess with the new one
+        k1 = k1_new;
+        k2 = k2_new;
+    }
+
+    // Uses the final guesses and the symplectic rk4 coefficients to update y.
+    return add(y, scale(h, add(scale(r4b1, k1), scale(r4b2, k2))));
+}
+
+
+// Symplectic RK6 coefficients
+const float s15 = 3.872983346207417;   // sqrt(15)
+const float r6a11 = 5.0/36.0;
+const float r6a12 = 2.0/9.0 - s15/15.0;
+const float r6a13 = 5.0/36.0 - s15/30.0;
+
+const float r6a21 = 5.0/36.0 + s15/24.0;
+const float r6a22 = 2.0/9.0;
+const float r6a23 = 5.0/36.0 - s15/24.0;
+
+const float r6a31 = 5.0/36.0 + s15/30.0;
+const float r6a32 = 2.0/9.0 + s15/15.0;
+const float r6a33 = 5.0/36.0;
+
+const float r6b1 = 5.0/18.0;
+const float r6b2 = 4.0/9.0;
+const float r6b3 = 5.0/18.0;
+
+
+// Symplectic RK6 step, uses fixed point iteration to solve the implicit RK method
+State symplectic_rk6(State y, State f0, float h) {
+    // Gives the initial guess for k1, k2, and k3 based on the input
+    State k1 = f0;
+    State k2 = f0;
+    State k3 = f0;
+
+    for (int i = 0; i < rkMaxIter; i++) {
+        State k1_new = hamiltonian(add(y, scale(h, add(add(scale(r6a11, k1), scale(r6a12, k2)), scale(r6a13, k3)))));
+        State k2_new = hamiltonian(add(y, scale(h, add(add(scale(r6a21, k1), scale(r6a22, k2)), scale(r6a23, k3)))));
+        State k3_new = hamiltonian(add(y, scale(h, add(add(scale(r6a31, k1), scale(r6a32, k2)), scale(r6a33, k3)))));
+
+        // Convergence check (2-norm)
+        if (norm(add(k1_new, scale(-1.0, k1))) < rkTol &&
+            norm(add(k2_new, scale(-1.0, k2))) < rkTol &&
+            norm(add(k3_new, scale(-1.0, k3))) < rkTol)
+            break;
+
+        // Replaces the previous guess with the new one
+        k1 = k1_new;
+        k2 = k2_new;
+        k3 = k3_new;
+    }
+
+    // Uses the final guesses and the symplectic rk6 coefficients to update y.
+    return add(y, scale(h, add(add(scale(r6b1, k1), scale(r6b2, k2)), scale(r6b3, k3))));
+}
+
+
+// We'll compute an rk4 and an rk6 step, find the error between them, and decide
+//whether to accept the rk4 step, or shrink the step size and try again until the
+//error is less than a given tolerance. (max_shrinks = 1, as in Appendix A)
+State symplectic_rk46_comparison(State y, float h) {
+    State f0 = hamiltonian(y);
+
+    // Define the current default step size
+    float h_current = h;
+    State y_rk4;
+
+    for (int attempt = 0; attempt < 2; attempt++) {
+        // Compute a symplectic rk4 step
+        y_rk4 = symplectic_rk4(y, f0, h_current);
+
+        // Compute a symplectic rk6 step
+        State y_rk6 = symplectic_rk6(y, f0, h_current);
+
+        // Find the 2 norm of their difference
+        float error = norm(add(y_rk6, scale(-1.0, y_rk4)));
+
+        // Accept symplectic rk4 step if error is below the tolerance
+        if (error < tol)
+            return y_rk4;
+
+        // Update step size using formula that's used in the rkf method.
+        // (A step so large that the fixed-point iteration blew up gives an
+        // infinite or NaN error; then just take a quarter of the step.)
+        h_current = error < 1e30 ? 0.9 * h_current * pow(tol / error, 0.2) : 0.25 * h_current;
+    }
+
+    // If the error still isn't below the tolerance after max_shrinks, accept the rk4 step
+    return y_rk4;
+}
+
+
+// Everything below is the picture, from blackhole-bg's shader.h. The disk
+// radii are in units of M here, and the disk turns and lights up according
+// to the Kerr metric.
+
+const float DISK_MAX_PATH = 3.5;
+const float TRIPLANAR_SHARPNESS = 4.0;
+
+// accretion gas look
+const int   DISK_OCTAVES     = 4;
+const float DISK_AZ_CELLS    = 9.0;
+const float DISK_CLUMP_CELLS = 3.0;
+const float DISK_WARP_CELLS  = 4.0;
+const float DISK_RAD_CELLS   = 7.0;
+const float DISK_SPIRAL      = 1.6;
+const float DISK_WARP        = 0.9;
+const float DISK_POW         = 1.6;
+const float DISK_OPACITY     = 0.85;
+const float DISK_GAIN        = 1.0;
+
+// Samples the sky image along a direction using a triplanar blend (no seams
+// or pinch points). blackhole-bg's y axis is the disk's normal, which is z
+// here, so the direction is passed in as (x, z, -y).
+vec3 starColor(vec3 dir, float lod) {
+    vec3 d = normalize(vec3(dir.x, dir.z, -dir.y));
+    vec3 wgt = pow(abs(d), vec3(TRIPLANAR_SHARPNESS));
+    wgt /= max(wgt.x + wgt.y + wgt.z, 1e-8);
+    return textureLod(starTex, d.zy * 0.5 + 0.5, lod).rgb * wgt.x
+         + textureLod(starTex, d.xz * 0.5 + 0.5, lod).rgb * wgt.y
+         + textureLod(starTex, d.xy * 0.5 + 0.5, lod).rgb * wgt.z;
+}
+
+float hash21(vec2 p) {
+    p = fract(p * vec2(127.1, 311.7));
+    p += dot(p, p + 41.17);
+    return fract(p.x * p.y);
+}
+
+// Value noise whose x axis wraps every `period` lattice cells
+float vnoiseWrap(vec2 p, float period) {
+    vec2 i = floor(p), f = fract(p);
+    f = f * f * (3.0 - 2.0 * f);
+    float x0 = mod(i.x, period);
+    float x1 = mod(i.x + 1.0, period);
+    float a00 = hash21(vec2(x0, i.y));
+    float a10 = hash21(vec2(x1, i.y));
+    float a01 = hash21(vec2(x0, i.y + 1.0));
+    float a11 = hash21(vec2(x1, i.y + 1.0));
+    return mix(mix(a00, a10, f.x), mix(a01, a11, f.x), f.y);
+}
+
+float fbmWrap(vec2 p, float period) {
+    float v = 0.0, amp = 0.5, per = period;
+    for (int i = 0; i < DISK_OCTAVES; i++) {
+        v += amp * vnoiseWrap(p, per);
+        p *= 2.0; per *= 2.0; amp *= 0.5;
+    }
+    return v;
+}
+
+// Emission and opacity of the gas at radius r and angle phi (in the frame
+// turning with the gas). pathScale is how much longer a slanted ray's path
+// through the gas is than a face-on one's. g is the redshift factor: the
+// ratio of the frequency the camera sees to the frequency the gas emits.
+vec3 diskEmission(float r, float phi, float pathScale, float g, out float alpha) {
+    float rn = clamp((r - diskInner) / (diskOuter - diskInner), 0.0, 1.0);
+
+    // Spiral shear, trailing behind the rotation
+    float turn = phi / (2.0 * PI) + 0.5 + DISK_SPIRAL * rn;
+    float rad  = rn * DISK_RAD_CELLS;
+
+    // Domain warp so filaments curl and braid
+    float wx = fbmWrap(vec2(turn * DISK_WARP_CELLS,       rad * 0.4),       DISK_WARP_CELLS);
+    float wy = fbmWrap(vec2(turn * DISK_WARP_CELLS + 5.2, rad * 0.4 + 3.1), DISK_WARP_CELLS);
+    float turnW = turn + (wx - 0.5) * DISK_WARP / DISK_AZ_CELLS;
+    float radW  = rad  + (wy - 0.5) * DISK_WARP;
+
+    // Ridged noise for streaks
+    float nf = fbmWrap(vec2(turnW * DISK_AZ_CELLS, radW * 2.5), DISK_AZ_CELLS);
+    float fil = 1.0 - abs(2.0 * nf - 1.0);
+    fil *= fil;
+
+    // Broad clumps around the ring
+    float clump = fbmWrap(vec2(turnW * DISK_CLUMP_CELLS, radW * 0.5), DISK_CLUMP_CELLS);
+
+    float density = pow(fil * (0.25 + 1.5 * clump), DISK_POW);
+    density *= smoothstep(0.0, 0.03, rn) * (1.0 - smoothstep(0.55, 1.0, rn));
+    density *= pathScale;
+
+    // Temperature ramp: white-hot inner rim -> orange -> deep red ember. A thin
+    // disk's temperature falls off as r^(-3/4), and the camera sees it times g,
+    // so gas coming towards us looks like hotter gas further in.
+    float rt = rn;
+    if (doppler) {
+        float rEff = r * pow(g, -4.0 / 3.0);
+        rt = clamp((rEff - diskInner) / (diskOuter - diskInner), 0.0, 1.0);
+    }
+    vec3 col = mix(vec3(1.00, 0.93, 0.78), vec3(1.00, 0.46, 0.10), smoothstep(0.0, 0.28, rt));
+    col = mix(col, vec3(0.55, 0.08, 0.02), smoothstep(0.28, 0.90, rt));
+    float bright = mix(2.0, 0.35, smoothstep(0.0, 0.70, rt));
+    // Relativistic beaming: specific intensity scales as g^3
+    if (doppler) bright *= g * g * g;
+
+    alpha = clamp(density * DISK_OPACITY, 0.0, 1.0);
+    return col * bright * DISK_GAIN;
+}
+
+// Orbital angular velocity d(phi)/dt of the gas on a circular orbit
+float kepler(float r) {
+    return sqrt(M) / (r * sqrt(r) + a * sqrt(M));
+}
+
+// Redshift factor for light leaving gas on a circular orbit at radius r.
+// p_t and p_phi are conserved along the ray; the ray started at the camera
+// with energy 1 as the camera measures it.
+float redshift(float r, float pt, float pphi) {
+    float Omega = kepler(r);
+    float gtt = -(1.0 - 2.0 * M / r);
+    float gtp = -2.0 * M * a / r;
+    float gpp = r * r + a * a + 2.0 * M * a * a / r;
+    float ut = inversesqrt(-(gtt + 2.0 * Omega * gtp + Omega * Omega * gpp));
+    return 1.0 / (ut * (pt + Omega * pphi));
+}
+
+// Direction of travel in Cartesian coordinates (treating Boyer-Lindquist
+// coordinates as spherical ones)
+vec3 cartesianVelocity(State y, State dy) {
+    float r = y.x.y, th = y.x.z, ph = y.x.w;
+    vec3 rhat = vec3(sin(th) * cos(ph), sin(th) * sin(ph), cos(th));
+    vec3 thhat = vec3(cos(th) * cos(ph), cos(th) * sin(ph), -sin(th));
+    vec3 phhat = vec3(-sin(ph), cos(ph), 0.0);
+    return dy.x.y * rhat + r * dy.x.z * thhat + r * sin(th) * dy.x.w * phhat;
+}
+
+vec3 cartesian(vec4 x) {
+    return x.y * vec3(sin(x.z) * cos(x.w), sin(x.z) * sin(x.w), cos(x.z));
+}
+
+void main() {
+    ivec2 size = imageSize(outImage);
+    ivec2 pix = ivec2(gl_GlobalInvocationID.xy) + ivec2(0, rowOffset);
+    if (pix.x >= size.x || pix.y >= size.y) return;
+
+    // The camera looks at the hole, with north (decreasing theta) up. In the
+    // camera's local frame (r, theta, phi directions) forward is -r, up is
+    // -theta and right is +phi.
+    float su = (2.0 * (float(pix.x) + 0.5) / float(size.x) - 1.0) * aspect * tanHalfFov;
+    float sv = (1.0 - 2.0 * (float(pix.y) + 0.5) / float(size.y)) * tanHalfFov;
+    vec3 n = normalize(vec3(-1.0, -sv, su));   // (r, theta, phi) components
+
+    // Momentum of the ray, using the frame of an observer who doesn't turn
+    // with the hole (the zero angular momentum observer). The ray is traced
+    // backwards: this is minus the momentum of the light arriving at the
+    // camera, which makes the integrator run it back to where it came from.
+    float rc = camera.x, s = sin(camera.y), c = cos(camera.y);
+    float Sigma = rc * rc + a * a * c * c;
+    float Delta = rc * rc - 2.0 * M * rc + a * a;
+    float A = (rc * rc + a * a) * (rc * rc + a * a) - a * a * Delta * s * s;
+    float alpha = sqrt(Delta * Sigma / A);           // lapse
+    float omega = 2.0 * M * a * rc / A;              // frame dragging
+    float sqrtgpp = sqrt(A / Sigma) * s;
+    State y = State(vec4(0.0, camera),
+                    vec4(alpha - omega * sqrtgpp * n.z,
+                         sqrt(Sigma / Delta) * n.x,
+                         sqrt(Sigma) * n.y,
+                         sqrtgpp * n.z));
+
+    vec3 accum = vec3(0.0);   // light from the disk, front to back
+    float trans = 1.0;        // how much of what's behind still shows through
+    int outcome = 0;          // 0 = ran out of steps, 1 = fell in, 2 = escaped, 3 = disk opaque
+    vec3 skyDir = vec3(0.0);
+    float psi = 0.0;          // total angle the ray has swept around the hole
+    vec3 pos = cartesian(y.x);
+
+    for (int i = 0; i < maxSteps; i++) {
+        // Steps scale with the distance from the hole, and from the spin axis
+        // near it, where phi changes quickly.
+        float h = stepScale * y.x.y * min(1.0, 2.0 * abs(sin(y.x.z)));
+        State y_new = symplectic_rk46_comparison(y, h);
+
+        // A ray heading inwards inside the innermost photon orbit can't turn
+        // back, so it's going to fall in. Stopping here also keeps the
+        // integrator away from the horizon, where the equations get stiff.
+        if (any(isnan(y_new.x)) || any(isnan(y_new.p)) || y_new.x.y < rHorizon
+            || (y_new.x.y < rCapture && y_new.p.y < 0.0)) {
+            outcome = 1;
+            break;
+        }
+
+        vec3 pos_new = cartesian(y_new.x);
+        psi += acos(clamp(dot(pos, pos_new) / (length(pos) * length(pos_new)), -1.0, 1.0));
+        pos = pos_new;
+
+        // Did the ray cross the equator, inside the disk?
+        float c0 = cos(y.x.z), c1 = cos(y_new.x.z);
+        if (diskEnabled && c0 * c1 <= 0.0 && c0 != c1) {
+            float frac = c0 / (c0 - c1);
+            float r = mix(y.x.y, y_new.x.y, frac);
+            if (r >= diskInner && r <= diskOuter) {
+                float phi = mix(y.x.w, y_new.x.w, frac);
+                // A ray that went over the axis carries on to negative theta,
+                // which is the same place as -theta on the other side.
+                if (sin(y_new.x.z) < 0.0) phi += PI;
+                float t = mix(y.x.x, y_new.x.x, frac);   // negative: light left the disk earlier
+
+                // How slanted the ray is through the disk
+                vec3 v = normalize(cartesianVelocity(y_new, hamiltonian(y_new)));
+                float pathScale = min(1.0 / max(abs(v.z), 1e-3), DISK_MAX_PATH);
+
+                float g = redshift(r, y.p.x, y.p.w);
+                float da;
+                // The gas pattern turns at the orbital speed, as seen when
+                // this light left it.
+                vec3 emis = diskEmission(r, phi - kepler(r) * (time + t), pathScale, g, da);
+                accum += trans * emis * da;
+                trans *= 1.0 - da;
+                if (trans < 0.02) {
+                    outcome = 3;
+                    break;
+                }
+            }
+        }
+
+        y = y_new;
+
+        // Escaped: heading outward far from the hole
+        if (y.x.y > rEscape && y.p.y > 0.0) {
+            outcome = 2;
+            skyDir = cartesianVelocity(y, hamiltonian(y));
+            break;
+        }
+    }
+
+    vec3 bg = vec3(0.0);
+    if (outcome == 2) {
+        // Strongly lensed rays see a squashed sky, so sample a blurrier level
+        float lensLod = clamp((psi - PI) * 0.7, 0.0, 5.0);
+        bg = starColor(skyDir, lensLod);
+    }
+    imageStore(outImage, pix, vec4(accum + trans * bg, 1.0));
+}

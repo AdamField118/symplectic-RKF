@@ -11,6 +11,7 @@ figures/
 *.png
 *.err
 *.out
+*.mp4
 
 # Include the reference figures
 !fig6a_schwarzschild_bernard.png
@@ -19,3 +20,6 @@ figures/
 # Fortran build output
 fortran/geodesic
 *.mod
+
+# Video build output
+visualization/blackhole

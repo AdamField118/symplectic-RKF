@@ -17,6 +17,9 @@ relativity*](https://digital.wpi.edu/concern/student_works/p26770734?locale=en)
 The C + GLSL, Fortran and JAX programs take the same command-line options and
 write the same `.npy` file.
 
+`visualization/` puts the integrator to work on something else: a video of a
+spinning black hole, with every pixel's light ray traced on the GPU.
+
 The method itself: at each step, take an implicit symplectic RK4 step and an
 implicit symplectic RK6 step (Gauss methods with 2 and 3 stages), each solved
 by fixed-point iteration. If the two agree to within `tol`, keep the RK4
@@ -37,7 +40,8 @@ step. If they don't, shrink `h` once using the RKF formula and try again.
 | `plot_figures.py` | Bernard's plotting function, used to draw his figures from any version's output. |
 | `compare_results.py` | Prints how far each version's trajectories are from the Python's. |
 | `paper_figures/` | Figures 6(a) and 7(a) as they appear in the MQP PDF, for comparison. |
-| `turing/` | A Slurm job for each version, and `run_all.sbatch`, which submits all four. |
+| `visualization/` | The black hole video: `blackhole.comp` traces the light rays, `render.c` runs it and hands the frames to ffmpeg. |
+| `turing/` | A Slurm job for each version, `run_all.sbatch`, which submits all four, and `visualization.sbatch` for the video. |
 
 ## Running on Turing
 
@@ -57,7 +61,9 @@ CONDA_OVERRIDE_CUDA=12.9 conda env create -f environment.yaml
 CUDA build otherwise won't install. `environment.yaml` pins every package to an
 exact version and build from conda-forge (Python 3.11.17, numpy 2.4.6,
 matplotlib 3.10.9, numba 0.68.0, libegl 1.7.0, gcc and gfortran 14.4.0, JAX
-0.10.2 for CUDA 12.9), so it builds the same environment every time.
+0.10.2 for CUDA 12.9, ffmpeg 5.1), so it builds the same environment every
+time. ffmpeg is there for the video; newer versions of it need libraries that
+clash with the ones JAX uses.
 
 Each version has its own Slurm job. Submit from the repository root:
 
@@ -221,3 +227,76 @@ results:
 - The 15,000 steps are split across several GPU dispatches (`--chunk`, 100 by
   default), so no single dispatch runs long enough to hit a GPU timeout. This
   doesn't change the results.
+
+## Black hole video
+
+`visualization/` renders a video of a Kerr black hole and its accretion disk.
+Each pixel is a light ray, traced backwards from the camera with Bernard's
+RK4/RK6 integrator in a compute shader, one ray per GPU thread. The look and
+the camera's path come from
+[blackhole-bg](https://codeberg.org/AdamField118/blackhole-bg): over 8
+seconds the camera sets off up and to the left out of the disk, circles the
+hole once and comes back to where it started, so the video loops.
+blackhole-bg's hole doesn't spin and uses its own integrator; this one is
+Appendix A's Kerr black hole (`a = 0.5`), so the shadow is lopsided, and the
+side of the disk coming towards the camera is brighter and whiter than the side
+going away.
+
+```bash
+sbatch turing/visualization.sbatch                # results/blackhole.mp4, 1280x720 at 30 fps
+sbatch turing/visualization.sbatch --width 1920 --height 1080 --fps 60
+```
+
+or by hand on a GPU node, with the environment active:
+
+```bash
+export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
+make -C visualization
+./visualization/blackhole --out results/blackhole.mp4
+./visualization/blackhole --frame 60 --out frame.png   # just one frame
+```
+
+The options are listed at the top of `visualization/render.c`. `--a 0` gives
+blackhole-bg's non-spinning hole, `--no-doppler` its colours, `--no-disk`
+just the hole and the stars.
+
+The program prints how long each frame took, and at the end how many frames
+per second it rendered and how that compares to real time. ffmpeg encodes on
+the CPU cores while the GPU draws, so the job asks for 8 of them. For more
+speed, lower the resolution or raise `--step`: `--step 0.15` was about 1.6
+times faster than the default 0.08 in tests, and changed 0.5% of pixels
+visibly.
+
+To keep it fast, the shader uses the integrator a little differently from
+Appendix A:
+
+- It works in single precision, which GPUs run 32 to 64 times faster than
+  double.
+- The derivatives of the inverse metric are worked out exactly instead of by
+  finite differences. In single precision `r + 1e-6` rounds back to `r`, and
+  the exact derivatives take one evaluation of the metric instead of eight.
+  They agree with Appendix A's `dgdx` to within its finite-difference error.
+- The tolerances are larger (`--tol 1e-3`, `--rk-tol 1e-5`), since single
+  precision can't get to 5e-11.
+- Each step starts with `h` proportional to the distance from the hole, so
+  rays take small steps close to it and big ones far away. The RK4/RK6
+  comparison then shrinks the step once if it needs to, as in Appendix A.
+- A ray stops when it heads inwards inside the innermost photon orbit, since
+  it can't come back out from there. Going on to the horizon itself made a
+  few rays come out wrong, because the equations get very stiff there.
+
+Two checks that the rays go where they should. With `a = 0`, the shadow seen
+from 20M has an angular radius of 14.270°; the exact value is 14.269°. With
+`a = 0.5` and `a = 0.9`, which rays fall in matches, pixel for pixel, a run
+with 8 times smaller steps and a 100 times smaller `--tol`.
+
+With no `--sky` the stars are generated. To use the Hubble image blackhole-bg
+uses, bake it the same way (or use the `starfield.rgb` from a blackhole-bg
+build):
+
+```bash
+curl -LO https://esahubble.org/media/archives/images/publicationtiff/heic1112d.tif
+ffmpeg -i heic1112d.tif -frames:v 1 -pix_fmt rgb24 -f rawvideo \
+    -vf "scale=2048:2048:force_original_aspect_ratio=increase,crop=2048:2048" starfield.rgb
+./visualization/blackhole --sky starfield.rgb --out results/blackhole.mp4
+```

@@ -4,6 +4,7 @@ channels:
   - nodefaults
 dependencies:
   - _openmp_mutex=4.5=20_gnu
+  - aom=3.4.0=h27087fc_1
   - binutils=2.46.1=default_h4852527_103
   - binutils_impl_linux-64=2.46.1=default_hfdba357_103
   - binutils_linux-64=2.46.1=default_h4852527_103
@@ -31,7 +32,15 @@ dependencies:
   - cuda-version=12.9=h4f385c5_3
   - cudnn=9.10.2.21=hbcb9cd8_0
   - cycler=0.12.1=pyhcf101f3_2
+  - ffmpeg=5.1.0=gpl_h45a1190_101
   - flatbuffers=25.9.23=hb7d4c21_0
+  - font-ttf-dejavu-sans-mono=2.37=hab24e00_0
+  - font-ttf-inconsolata=3.000=h77eed37_0
+  - font-ttf-source-code-pro=2.038=h77eed37_0
+  - font-ttf-ubuntu=0.83=h77eed37_3
+  - fontconfig=2.18.3=h4db4eae_1
+  - fonts-conda-ecosystem=1=0
+  - fonts-conda-forge=1=hc364b38_1
   - fonttools=4.66.1=py311h92159aa_0
   - fortran-compiler=1.11.0=h9bea470_0
   - freetype=2.14.3=ha770c72_2
@@ -41,11 +50,14 @@ dependencies:
   - gfortran=14.4.0=hc6a0c74_7
   - gfortran_impl_linux-64=14.4.0=he75539a_7
   - gfortran_linux-64=14.4.0=ha2afc21_2
+  - gmp=6.3.0=hfd2156b_3
+  - gnutls=3.7.6=he274497_3
   - importlib-metadata=9.0.1=pyhcf101f3_0
   - jax=0.10.2=pyhd8ed1ab_0
   - jaxlib=0.10.2=cuda129_py311h54675af_201
   - kernel-headers_linux-64=6.12.0=he073ed8_6
   - kiwisolver=1.5.1=py311h4c6fd42_3
+  - lame=3.100=h166bdaf_1003
   - lcms2=2.19.1=h9073bf1_3
   - ld_impl_linux-64=2.46.1=default_hbd61a6d_103
   - lerc=4.2.0=hdb68285_0
@@ -68,6 +80,7 @@ dependencies:
   - libcusparse=12.5.10.65=hecca717_2
   - libcusparse-dev=12.5.10.65=hecca717_2
   - libdeflate=1.25=hd45a770_1
+  - libdrm=2.4.129=h7cc23a3_0
   - libegl=1.7.0=ha4b6fd6_5
   - libexpat=2.8.5=hd2095e1_0
   - libffi=3.7.0=h81df57d_1
@@ -78,15 +91,20 @@ dependencies:
   - libgcc-ng=16.2.0=h69a702a_7
   - libgfortran=16.2.0=h69a702a_7
   - libgfortran5=16.2.0=h6b99dfc_7
+  - libgl=1.7.0=ha4b6fd6_5
   - libglvnd=1.7.0=ha4b6fd6_5
+  - libglx=1.7.0=ha4b6fd6_5
   - libgomp=16.2.0=he0feb66_7
   - libgrpc=1.78.1=h1d1128b_0
+  - libiconv=1.18=h0cb94f2_3
+  - libidn2=2.3.8=hfac485b_1
   - libjpeg-turbo=3.2.0=hb03c661_1
   - liblapack=3.11.0=11_h47877c9_openblas
   - liblzma=5.8.3=hb03c661_1
   - libnsl=2.0.1=hb9d3cd8_1
   - libnvjitlink=12.9.86=hecca717_2
   - libopenblas=0.3.34=pthreads_hf13c14d_2
+  - libpciaccess=0.19=hb03c661_1
   - libpng=1.6.59=h922cc85_0
   - libprotobuf=6.33.5=h538a264_2
   - libpython=3.11.17=h0c77377_1_cpython
@@ -96,11 +114,16 @@ dependencies:
   - libstdcxx=16.2.0=h934c35e_7
   - libstdcxx-devel_linux-64=14.4.0=ha5b54cb_107
   - libstdcxx-ng=16.2.0=hdf11a46_7
+  - libtasn1=4.21.0=hb03c661_1
   - libtiff=4.7.2=hcc2c06a_1
+  - libunistring=0.9.10=h7f98852_0
   - libuuid=2.42.4=hcfc3c73_0
+  - libva=2.24.1=hb83e432_1
+  - libvpx=1.11.0=h9c3ff4c_3
   - libwebp-base=1.6.0=hd42ef1d_1
   - libxcb=1.17.0=hb83e432_2
   - libxcrypt=4.4.38=h280c20c_0
+  - libxml2=2.13.9=h2cb61b6_0
   - libzlib=1.3.2=h25fd6f3_3
   - llvmlite=0.50.0=py311h1369f55_0
   - make=4.4.1=hb03c661_3
@@ -109,10 +132,12 @@ dependencies:
   - munkres=1.1.4=pyhd8ed1ab_1
   - nccl=2.32.3.1=h4d09622_0
   - ncurses=6.6=hdb14827_1
+  - nettle=3.8.1=hc379101_1
   - numba=0.68.0=py311hdfc3925_1
   - numpy=2.4.6=py311h2e04523_0
   - onednn=3.13.4=threadpool_h2b436bf_0
   - onednn-cpu-threadpool=3.13.4=threadpool_h99590a1_0
+  - openh264=2.3.0=h27087fc_0
   - openjpeg=2.5.4=heb1ab33_2
   - openssl=3.6.5=h781a0a9_0
   - opt_einsum=3.4.0=pyhd8ed1ab_1
@@ -130,13 +155,21 @@ dependencies:
   - scipy=1.17.1=py311hbe70eeb_1
   - setuptools=84.0.0=pyh332efcf_0
   - six=1.17.0=pyhe01879c_1
+  - svt-av1=1.2.0=h27087fc_0
   - sysroot_linux-64=2.39=hc4b9eeb_6
   - tk=8.6.13=noxft_h1df4ec4_4
   - tzdata=2026c=h151e31d_0
   - unicodedata2=18.0.0=py311h0d48ccd_0
+  - wayland=1.26.0=hc1c935e_2
+  - wayland-protocols=1.49=hd8ed1ab_0
   - wheel=0.48.0=pyhd8ed1ab_0
+  - x264=1!164.3095=h7cc23a3_3
+  - x265=3.5=h73f68a7_4
+  - xorg-libx11=1.8.13=he1eb515_1
   - xorg-libxau=1.0.12=h7cc23a3_2
   - xorg-libxdmcp=1.1.5=h7cc23a3_2
+  - xorg-libxext=1.3.7=h7cc23a3_1
+  - xorg-libxfixes=6.0.2=h7cc23a3_1
   - zipp=4.1.1=pyh5ded981_0
   - zlib-ng=2.3.3=hce19668_1
   - zstd=1.5.7=hb78ec9c_7
