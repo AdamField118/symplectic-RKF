@@ -193,10 +193,18 @@ double fifth_root(double x) {
 
 // From here on it's Appendix A.
 
+// The metric and its derivatives are kept in flat arrays: g[G(i, j)] is
+// g[i, j] in the Python and dg[DG(w, i, j)] is dg[w, i, j]. NVIDIA's driver
+// (595.71) stores double arrays of arrays, like double g[4][4], at single
+// precision, which wrecks the finite differences in dgdx(). Flat double
+// arrays keep their full precision.
+int G(int i, int j) { return 4 * i + j; }
+int DG(int w, int i, int j) { return 16 * w + 4 * i + j; }
+
 // Inverse Kerr metric (uses the inverse metric like the Fantasty code). Takes in
 //a vector of length 4 representing the 4 Boyder-Lindquist coordinates: t, r,
 //theta, and phi
-void inverse_metric(double x[4], out double g[4][4]) {
+void inverse_metric(double x[4], out double g[16]) {
 
     double t = x[0];
     double r = x[1];
@@ -210,29 +218,29 @@ void inverse_metric(double x[4], out double g[4][4]) {
     double sin_theta = dsin(theta);
 
     //Input all the spacetime metric components (Kerr for this example)
-    g[0][0] = ddiv(-((r*r + a*a)*(r*r + a*a) - (a*a) * Delta * (sin_theta*sin_theta)), Delta * Sigma);
-    g[0][1] = 0.0LF;
-    g[0][2] = 0.0LF;
-    g[0][3] = ddiv(-2.0LF * M * a * r, Delta * Sigma);
+    g[G(0, 0)] = ddiv(-((r*r + a*a)*(r*r + a*a) - (a*a) * Delta * (sin_theta*sin_theta)), Delta * Sigma);
+    g[G(0, 1)] = 0.0LF;
+    g[G(0, 2)] = 0.0LF;
+    g[G(0, 3)] = ddiv(-2.0LF * M * a * r, Delta * Sigma);
 
-    g[1][0] = g[0][1];
-    g[1][1] = ddiv(Delta, Sigma);
-    g[1][2] = 0.0LF;
-    g[1][3] = 0.0LF;
+    g[G(1, 0)] = g[G(0, 1)];
+    g[G(1, 1)] = ddiv(Delta, Sigma);
+    g[G(1, 2)] = 0.0LF;
+    g[G(1, 3)] = 0.0LF;
 
-    g[2][0] = g[0][2];
-    g[2][1] = g[1][2];
-    g[2][2] = ddiv(1.0LF, Sigma);
-    g[2][3] = 0.0LF;
+    g[G(2, 0)] = g[G(0, 2)];
+    g[G(2, 1)] = g[G(1, 2)];
+    g[G(2, 2)] = ddiv(1.0LF, Sigma);
+    g[G(2, 3)] = 0.0LF;
 
-    g[3][0] = g[0][3];
-    g[3][1] = g[1][3];
-    g[3][2] = g[2][3];
-    g[3][3] = ddiv(Delta - (a*a) * (sin_theta*sin_theta), Delta * Sigma * (sin_theta*sin_theta));
+    g[G(3, 0)] = g[G(0, 3)];
+    g[G(3, 1)] = g[G(1, 3)];
+    g[G(3, 2)] = g[G(2, 3)];
+    g[G(3, 3)] = ddiv(Delta - (a*a) * (sin_theta*sin_theta), Delta * Sigma * (sin_theta*sin_theta));
 }
 
 // Numerical derivatives of inverse metric
-void dgdx(double x[4], out double dg[4][4][4]) {
+void dgdx(double x[4], out double dg[64]) {
     const double delta = 1e-6LF;
 
     // Uses central finite differences to approximate each partial derivative.
@@ -243,12 +251,12 @@ void dgdx(double x[4], out double dg[4][4][4]) {
         double x_minus[4] = x;
         x_plus[w] = x[w] + delta;
         x_minus[w] = x[w] - delta;
-        double g_plus[4][4], g_minus[4][4];
+        double g_plus[16], g_minus[16];
         inverse_metric(x_plus, g_plus);
         inverse_metric(x_minus, g_minus);
         for (int i = 0; i < 4; i++)
             for (int j = 0; j < 4; j++)
-                dg[w][i][j] = ddiv(g_plus[i][j] - g_minus[i][j], 2.0LF * delta);
+                dg[DG(w, i, j)] = ddiv(g_plus[G(i, j)] - g_minus[G(i, j)], 2.0LF * delta);
     }
 }
 
@@ -260,8 +268,8 @@ void hamiltonian(double y[8], out double dydt[8]) {
     double x[4] = double[4](y[0], y[1], y[2], y[3]);
     double p[4] = double[4](y[4], y[5], y[6], y[7]);
 
-    double g[4][4];
-    double dg[4][4][4];
+    double g[16];
+    double dg[64];
     inverse_metric(x, g);
     dgdx(x, dg);
 
@@ -269,7 +277,7 @@ void hamiltonian(double y[8], out double dydt[8]) {
     //derivatives of the position and momentum components
     for (int i = 0; i < 4; i++) {
         double s = 0.0LF;
-        for (int j = 0; j < 4; j++) s += g[i][j] * p[j];
+        for (int j = 0; j < 4; j++) s += g[G(i, j)] * p[j];
         dydt[i] = s;
     }
 
@@ -279,7 +287,7 @@ void hamiltonian(double y[8], out double dydt[8]) {
         double dp = 0.0LF;
         for (int u = 0; u < 4; u++)
             for (int v = 0; v < 4; v++)
-                dp = dp - 0.5LF * dg[w][u][v] * p[u] * p[v];
+                dp = dp - 0.5LF * dg[DG(w, u, v)] * p[u] * p[v];
         dydt[4 + w] = dp;
     }
 }
