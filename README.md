@@ -18,7 +18,8 @@ The C + GLSL, Fortran and JAX programs take the same command-line options and
 write the same `.npy` file.
 
 `visualization/` puts the integrator to work on something else: a video of a
-spinning black hole, with every pixel's light ray traced on the GPU.
+spinning black hole, and a live view of it in a web page, with every pixel's
+light ray traced on the GPU.
 
 The method itself: at each step, take an implicit symplectic RK4 step and an
 implicit symplectic RK6 step (Gauss methods with 2 and 3 stages), each solved
@@ -40,8 +41,8 @@ step. If they don't, shrink `h` once using the RKF formula and try again.
 | `plot_figures.py` | Bernard's plotting function, used to draw his figures from any version's output. |
 | `compare_results.py` | Prints how far each version's trajectories are from the Python's. |
 | `paper_figures/` | Figures 6(a) and 7(a) as they appear in the MQP PDF, for comparison. |
-| `visualization/` | The black hole video: `blackhole.comp` traces the light rays, `render.c` runs it and hands the frames to ffmpeg. |
-| `turing/` | A Slurm job for each version, `run_all.sbatch`, which submits all four, and `visualization.sbatch` for the video. |
+| `visualization/` | The black hole video and live viewer: `blackhole.comp` traces the light rays, `render.c` runs it and hands the frames to ffmpeg (or to `viewer.py`, the viewer's web server, whose page is `viewer/index.html`). |
+| `turing/` | A Slurm job for each version, `run_all.sbatch`, which submits all four, `visualization.sbatch` for the video and `viewer.sbatch` for the live viewer. |
 
 ## Running on Turing
 
@@ -61,9 +62,10 @@ CONDA_OVERRIDE_CUDA=12.9 conda env create -f environment.yaml
 CUDA build otherwise won't install. `environment.yaml` pins every package to an
 exact version and build from conda-forge (Python 3.11.17, numpy 2.4.6,
 matplotlib 3.10.9, numba 0.68.0, libegl 1.7.0, gcc and gfortran 14.4.0, JAX
-0.10.2 for CUDA 12.9, ffmpeg 5.1), so it builds the same environment every
-time. ffmpeg is there for the video; newer versions of it need libraries that
-clash with the ones JAX uses.
+0.10.2 for CUDA 12.9, ffmpeg 5.1, Flask-SocketIO 5.7), so it builds the same
+environment every time. ffmpeg is there for the video (newer versions of it
+need libraries that clash with the ones JAX uses), and Flask-SocketIO for the
+live viewer.
 
 Each version has its own Slurm job. Submit from the repository root:
 
@@ -300,3 +302,50 @@ ffmpeg -i heic1112d.tif -frames:v 1 -pix_fmt rgb24 -f rawvideo \
     -vf "scale=2048:2048:force_original_aspect_ratio=increase,crop=2048:2048" starfield.rgb
 ./visualization/blackhole --sky starfield.rgb --out results/blackhole.mp4
 ```
+
+### Live viewer
+
+`visualization/viewer.py` shows the same black hole in a web page you can
+move around in, rendered live on a GPU node. Drag to move around the hole at
+the same distance (it stays in the middle of the screen), and scroll or use
+the distance slider to move closer or further away. The page also has sliders
+for the spin, field of view, step size, resolution and JPEG quality, switches
+for the disk, the Doppler colours and the gas's motion, a button that plays
+the flythrough from the video, and a readout of the frame rate and where each
+frame's time goes.
+
+```bash
+sbatch turing/viewer.sbatch      # runs for up to 2 hours; scancel it when you're done
+grep -m1 ondemand slurm_outfiles/slurm-srkf-viewer-<job>.out
+```
+
+and open the `https://ondemand.turing.wpi.edu/node/...` address it prints,
+from any browser where you can log in to Turing's Open OnDemand. Or run it
+from a GPU node's shell (`sinteractive` or `srun --gres=gpu:1 --pty bash`)
+with the environment active:
+
+```bash
+export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
+make -C visualization
+python visualization/viewer.py                  # port 4630
+python visualization/viewer.py 4631 --sky starfield.rgb
+```
+
+It works like [RPS_GPU_webui](https://github.com/jacksonhenry3/RPS_GPU_webui).
+`viewer.py` runs `blackhole --serve`, which keeps the shader loaded and draws a
+frame whenever it's asked to. The server sends the renderer the current camera
+and settings, encodes the frame as a JPEG and sends it to the browser over a
+websocket. The browser asks for a new frame each time it shows one, and at
+most two are on their way at once: the GPU can draw the next frame while the
+last one is travelling, but frames never pile up, so the picture keeps up
+with the mouse. Everyone who opens the page sees and moves the same camera.
+
+The latitude is kept 3° away from the poles, because the camera keeps north
+at the top of the screen and that flips over at a pole. The distance goes
+from 3M to 200M.
+
+At 1280×720 on an RTX PRO 6000 the GPU draws a frame in about 5 ms, so the
+frame rate is set by the JPEG encoding and the connection, not the black
+hole. The readout shows how long each part takes; "round trip" is from asking
+for a frame to showing it. If the frame rate is low with the GPU time small,
+lower the resolution or the JPEG quality.

@@ -7,7 +7,8 @@
  * where it started.
  *
  * Like ../glsl/main.c it needs no window: the OpenGL context comes from EGL.
- * Frames are piped to ffmpeg, which writes the video.
+ * Frames are piped to ffmpeg, which writes the video. With --serve it draws
+ * frames on request for the live viewer (viewer.py) instead; see serve().
  *
  *     cc -O2 -std=c11 -pthread -o blackhole render.c -ldl -lm
  *
@@ -34,6 +35,7 @@
  *                       (default: a generated starfield)
  *   --shader <path>     compute shader (default: blackhole.comp next to the binary)
  *   --ffmpeg <path>     ffmpeg executable (default ffmpeg)
+ *   --serve             draw frames on request for viewer.py (see serve())
  *
  * Environment variables:
  *   EGL_LIBRARY=<path>   use this libEGL.so.1 instead of searching for one
@@ -139,6 +141,7 @@ GLFN(void, glUniform1i, GLint, GLint)
 GLFN(void, glUniform1f, GLint, GLfloat)
 GLFN(void, glUniform3f, GLint, GLfloat, GLfloat, GLfloat)
 GLFN(void, glGenTextures, GLsizei, GLuint *)
+GLFN(void, glDeleteTextures, GLsizei, const GLuint *)
 GLFN(void, glBindTexture, GLenum, GLuint)
 GLFN(void, glActiveTexture, GLenum)
 GLFN(void, glTexStorage2D, GLenum, GLsizei, GLenum, GLsizei, GLsizei)
@@ -264,6 +267,7 @@ static void create_context(void) {
     LOAD_GL(glLinkProgram); LOAD_GL(glGetProgramiv); LOAD_GL(glGetProgramInfoLog);
     LOAD_GL(glUseProgram); LOAD_GL(glGetUniformLocation); LOAD_GL(glUniform1i);
     LOAD_GL(glUniform1f); LOAD_GL(glUniform3f); LOAD_GL(glGenTextures);
+    LOAD_GL(glDeleteTextures);
     LOAD_GL(glBindTexture); LOAD_GL(glActiveTexture); LOAD_GL(glTexStorage2D);
     LOAD_GL(glTexSubImage2D); LOAD_GL(glTexParameteri); LOAD_GL(glGenerateMipmap);
     LOAD_GL(glPixelStorei); LOAD_GL(glBindImageTexture); LOAD_GL(glGetTexImage);
@@ -519,12 +523,140 @@ static void *writer(void *arg) {
     return NULL;
 }
 
+/* Drawing */
+typedef struct {
+    double M, a, fov, step, tol, rk_tol;
+    int rk_max_iter, max_steps, disk, doppler;
+} Settings;
+
+static GLuint prog, target;
+static int target_w, target_h;
+static GLint loc_camera, loc_time, loc_row, loc_escape;
+
+/* (Re)makes the texture the shader draws into */
+static void make_target(int width, int height) {
+    if (target && width == target_w && height == target_h) return;
+    if (target) glDeleteTextures(1, &target);
+    glGenTextures(1, &target);
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, target);
+    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, width, height);
+    glBindImageTexture(0, target, 0, 0, 0, GL_WRITE_ONLY, GL_RGBA8);
+    target_w = width;
+    target_h = height;
+}
+
+#define U(name) glGetUniformLocation(prog, name)
+
+static void apply_settings(const Settings *S, int width, int height, int verbose) {
+    double M = S->M, a = S->a;
+    double r_plus = M + sqrt(M * M - a * a);
+    double r_isco = isco(M, a);
+    /* Innermost (prograde, equatorial) photon orbit */
+    double r_photon = 2 * M * (1 + cos(2.0 / 3.0 * acos(-fabs(a) / M)));
+    glUniform1i(U("starTex"), 1);
+    glUniform1f(U("M"), (float)M);
+    glUniform1f(U("a"), (float)a);
+    glUniform1f(U("tanHalfFov"), (float)tan(S->fov * M_PI / 360.0));
+    glUniform1f(U("aspect"), (float)width / height);
+    glUniform1i(U("maxSteps"), S->max_steps);
+    glUniform1f(U("stepScale"), (float)S->step);
+    glUniform1f(U("tol"), (float)S->tol);
+    glUniform1f(U("rkTol"), (float)S->rk_tol);
+    glUniform1i(U("rkMaxIter"), S->rk_max_iter);
+    glUniform1f(U("rHorizon"), (float)(1.01 * r_plus));
+    glUniform1f(U("rCapture"), (float)r_photon);
+    glUniform1f(U("diskInner"), (float)r_isco);
+    glUniform1f(U("diskOuter"), (float)(13.0 * M));
+    glUniform1i(U("diskEnabled"), S->disk);
+    glUniform1i(U("doppler"), S->doppler);
+    if (verbose)
+        fprintf(stderr, "a = %g M: horizon at r = %.4f M, innermost photon orbit at %.4f M, "
+                "disk from %.4f M to %g M\n", a / M, r_plus / M, r_photon / M, r_isco / M, 13.0);
+}
+
+/* Draws one frame into the target and waits for it. Returns the time it took. */
+static double draw(const double cam[3], double time) {
+    glUniform3f(loc_camera, (float)cam[0], (float)cam[1], (float)cam[2]);
+    glUniform1f(loc_time, (float)time);
+    /* Rays moving outward past 3 times the camera's distance have escaped */
+    glUniform1f(loc_escape, (float)(3.0 * cam[0]));
+
+    /* The frame is drawn in bands of rows, so that no single dispatch runs
+       long enough to trip a desktop GPU's watchdog. */
+    const int band = 128;
+    double t0 = now();
+    for (int row = 0; row < target_h; row += band) {
+        glUniform1i(loc_row, row);
+        int rows = target_h - row < band ? target_h - row : band;
+        glDispatchCompute((GLuint)(target_w + 7) / 8, (GLuint)(rows + 7) / 8, 1);
+    }
+    glMemoryBarrier(GL_TEXTURE_UPDATE_BARRIER_BIT);
+    glFinish();
+    return now() - t0;
+}
+
+/* The live viewer's side of things. viewer.py sends one command per line on
+   stdin and reads the answers on stdout:
+
+     frame W H r theta phi time a fov step disk doppler
+         Draws a W x H frame with the camera at (r, theta, phi) and the gas
+         at coordinate time `time`. Answers with W and H (two int32s), the
+         time drawing took in milliseconds (a float32), then the picture as
+         W * H * 3 bytes of RGB, top row first.
+     path t r
+         Where the flythrough's camera is at t (0 to 1) when it flies at
+         radius r. Answers with r, theta and phi as three float64s.
+
+   It stops at the end of stdin. */
+static int serve(Settings S) {
+    char line[1024];
+    unsigned char *pixels = NULL;
+    size_t capacity = 0;
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    while (fgets(line, sizeof line, stdin)) {
+        int w, h, disk, doppler;
+        double cam[3], time, a, fov, step, t, r;
+        if (sscanf(line, "frame %d %d %lf %lf %lf %lf %lf %lf %lf %d %d", &w, &h, &cam[0],
+                   &cam[1], &cam[2], &time, &a, &fov, &step, &disk, &doppler) == 11) {
+            if (w < 8 || h < 8 || w > 8192 || h > 8192) die("bad frame size");
+            S.a = fmax(-0.999 * S.M, fmin(0.999 * S.M, a));
+            S.fov = fov;
+            S.step = step;
+            S.disk = disk;
+            S.doppler = doppler;
+            make_target(w, h);
+            apply_settings(&S, w, h, 0);
+            float ms = (float)(1e3 * draw(cam, time));
+            size_t bytes = (size_t)w * h * 3;
+            if (bytes > capacity) {
+                pixels = realloc(pixels, bytes);
+                if (!pixels) die("out of memory");
+                capacity = bytes;
+            }
+            glGetTexImage(GL_TEXTURE_2D, 0, GL_RGB, GL_UNSIGNED_BYTE, pixels);
+            int32_t size[2] = {w, h};
+            fwrite(size, sizeof size, 1, stdout);
+            fwrite(&ms, sizeof ms, 1, stdout);
+            fwrite(pixels, 1, bytes, stdout);
+        } else if (sscanf(line, "path %lf %lf", &t, &r) == 2) {
+            flythrough(t, r, cam);
+            fwrite(cam, sizeof cam, 1, stdout);
+        } else {
+            fprintf(stderr, "unknown command: %s", line);
+            return 1;
+        }
+        fflush(stdout);
+    }
+    return 0;
+}
+
 /* main */
 int main(int argc, char **argv) {
     int width = 1280, height = 720, frame_only = 0, max_steps = 2000, rk_max_iter = 20;
     double fps = 30, seconds = 8, M = 1.0, a = 0.5, distance = 20, fov = 60;
     double step = 0.08, tol = 1e-3, rk_tol = 1e-5, disk_speed = 8;
-    int disk = 1, doppler = 1;
+    int disk = 1, doppler = 1, serving = 0;
     const char *out = "blackhole.mp4", *sky = NULL, *shader = NULL, *ffmpeg = "ffmpeg";
 
     for (int i = 1; i < argc; i++) {
@@ -535,6 +667,7 @@ int main(int argc, char **argv) {
         }
         if (!strcmp(k, "--no-disk")) { disk = 0; continue; }
         if (!strcmp(k, "--no-doppler")) { doppler = 0; continue; }
+        if (!strcmp(k, "--serve")) { serving = 1; continue; }
         const char *v = i + 1 < argc ? argv[i + 1] : NULL;
         if (!v) die("option without a value");
         i++;
@@ -577,43 +710,22 @@ int main(int argc, char **argv) {
     }
 
     create_context();
-    GLuint prog = build_program(shader);
+    prog = build_program(shader);
     glUseProgram(prog);
     load_sky(sky);
+    loc_camera = U("camera");
+    loc_time = U("time");
+    loc_row = U("rowOffset");
+    loc_escape = U("rEscape");
 
-    GLuint target;
-    glGenTextures(1, &target);
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, target);
-    glTexStorage2D(GL_TEXTURE_2D, 1, GL_RGBA8, width, height);
-    glBindImageTexture(0, target, 0, 0, 0, GL_WRITE_ONLY, GL_RGBA8);
+    Settings S = {.M = M, .a = a, .fov = fov, .step = step, .tol = tol, .rk_tol = rk_tol,
+                  .rk_max_iter = rk_max_iter, .max_steps = max_steps, .disk = disk,
+                  .doppler = doppler};
+    if (serving) return serve(S);
 
-    double r_plus = M + sqrt(M * M - a * a);
-    double r_isco = isco(M, a);
-    /* Innermost (prograde, equatorial) photon orbit */
-    double r_photon = 2 * M * (1 + cos(2.0 / 3.0 * acos(-fabs(a) / M)));
-#define U(name) glGetUniformLocation(prog, name)
-    glUniform1i(U("starTex"), 1);
-    glUniform1f(U("M"), (float)M);
-    glUniform1f(U("a"), (float)a);
-    glUniform1f(U("tanHalfFov"), (float)tan(fov * M_PI / 360.0));
-    glUniform1f(U("aspect"), (float)width / height);
-    glUniform1i(U("maxSteps"), max_steps);
-    glUniform1f(U("stepScale"), (float)step);
-    glUniform1f(U("tol"), (float)tol);
-    glUniform1f(U("rkTol"), (float)rk_tol);
-    glUniform1i(U("rkMaxIter"), rk_max_iter);
-    glUniform1f(U("rHorizon"), (float)(1.01 * r_plus));
-    glUniform1f(U("rCapture"), (float)r_photon);
-    glUniform1f(U("rEscape"), (float)(3.0 * distance));
-    glUniform1f(U("diskInner"), (float)r_isco);
-    glUniform1f(U("diskOuter"), (float)(13.0 * M));
-    glUniform1i(U("diskEnabled"), disk);
-    glUniform1i(U("doppler"), doppler);
-    GLint loc_camera = U("camera"), loc_time = U("time"), loc_row = U("rowOffset");
+    make_target(width, height);
+    apply_settings(&S, width, height, 1);
     if (glGetError() != 0) die("OpenGL setup failed");
-    fprintf(stderr, "a = %g M: horizon at r = %.4f M, innermost photon orbit at %.4f M, "
-            "disk from %.4f M to %g M\n", a / M, r_plus / M, r_photon / M, r_isco / M, 13.0);
 
     char cmd[8192];
     if (png)
@@ -636,9 +748,6 @@ int main(int argc, char **argv) {
     pthread_create(&writer_thread, NULL, writer, NULL);
     glPixelStorei(GL_PACK_ALIGNMENT, 1);
 
-    /* Each frame is drawn in bands of rows, so that no single dispatch runs
-       long enough to trip a desktop GPU's watchdog. */
-    const int band = 128;
     double total_render = 0, start = now();
     for (int f = 0; f < frames; f++) {
         int index = png ? frame_only : f;
@@ -646,18 +755,7 @@ int main(int argc, char **argv) {
         double cam[3];
         /* frames / fps is one full orbit, so the video loops */
         flythrough(png ? t / seconds : (double)f / frames, distance * M, cam);
-        glUniform3f(loc_camera, (float)cam[0], (float)cam[1], (float)cam[2]);
-        glUniform1f(loc_time, (float)(t * disk_speed * M));
-
-        double t0 = now();
-        for (int row = 0; row < height; row += band) {
-            glUniform1i(loc_row, row);
-            int rows = height - row < band ? height - row : band;
-            glDispatchCompute((GLuint)(width + 7) / 8, (GLuint)(rows + 7) / 8, 1);
-        }
-        glMemoryBarrier(GL_TEXTURE_UPDATE_BARRIER_BIT);
-        glFinish();
-        double dt = now() - t0;
+        double dt = draw(cam, t * disk_speed * M);
         total_render += dt;
 
         int slot = f % 2;

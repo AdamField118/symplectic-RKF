@@ -5,15 +5,18 @@ channels:
 dependencies:
   - _openmp_mutex=4.5=20_gnu
   - aom=3.4.0=h27087fc_1
+  - bidict=0.24.1=pyhc364b38_0
   - binutils=2.46.1=default_h4852527_103
   - binutils_impl_linux-64=2.46.1=default_hfdba357_103
   - binutils_linux-64=2.46.1=default_h4852527_103
+  - blinker=1.9.0=pyhff2d567_0
   - brotli=1.2.0=h505cf86_4
   - brotli-bin=1.2.0=h9908984_4
   - bzip2=1.0.8=hda65f42_10
   - c-ares=1.34.8=hebe6cf0_2
   - c-compiler=1.11.0=h4d9bdce_0
   - ca-certificates=2026.7.22=hbd8a1cb_0
+  - click=8.5.0=pyh5ded981_0
   - conda-gcc-specs=14.4.0=h611768e_7
   - contourpy=1.3.3=py311h724c32c_4
   - cuda-cccl_linux-64=12.9.27=ha770c72_0
@@ -33,6 +36,8 @@ dependencies:
   - cudnn=9.10.2.21=hbcb9cd8_0
   - cycler=0.12.1=pyhcf101f3_2
   - ffmpeg=5.1.0=gpl_h45a1190_101
+  - flask=3.1.3=pyhcf101f3_1
+  - flask-socketio=5.7.0=pyh5ded981_0
   - flatbuffers=25.9.23=hb7d4c21_0
   - font-ttf-dejavu-sans-mono=2.37=hab24e00_0
   - font-ttf-inconsolata=3.000=h77eed37_0
@@ -52,9 +57,12 @@ dependencies:
   - gfortran_linux-64=14.4.0=ha2afc21_2
   - gmp=6.3.0=hfd2156b_3
   - gnutls=3.7.6=he274497_3
+  - h11=0.16.0=pyhcf101f3_1
   - importlib-metadata=9.0.1=pyhcf101f3_0
+  - itsdangerous=2.2.0=pyhd8ed1ab_1
   - jax=0.10.2=pyhd8ed1ab_0
   - jaxlib=0.10.2=cuda129_py311h54675af_201
+  - jinja2=3.1.6=pyhcf101f3_1
   - kernel-headers_linux-64=6.12.0=he073ed8_6
   - kiwisolver=1.5.1=py311h4c6fd42_3
   - lame=3.100=h166bdaf_1003
@@ -127,6 +135,7 @@ dependencies:
   - libzlib=1.3.2=h25fd6f3_3
   - llvmlite=0.50.0=py311h1369f55_0
   - make=4.4.1=hb03c661_3
+  - markupsafe=3.0.4=py311h364832d_1
   - matplotlib-base=3.10.9=py311h0f3be63_0
   - ml_dtypes=0.5.4=np2py311h5a3f614_2
   - munkres=1.1.4=pyhd8ed1ab_1
@@ -148,21 +157,27 @@ dependencies:
   - pyparsing=3.3.3=pyh5ded981_0
   - python=3.11.17=h5f976f7_1_cpython
   - python-dateutil=2.9.0.post0=pyhe01879c_2
+  - python-engineio=4.14.0=pyhcf101f3_0
+  - python-socketio=5.17.0=pyh5ded981_0
   - python_abi=3.11=9_cp311
   - qhull=2020.2=h434a139_5
   - re2=2025.11.05=h5301d42_1
   - readline=8.3=hd6e31c0_1
   - scipy=1.17.1=py311hbe70eeb_1
   - setuptools=84.0.0=pyh332efcf_0
+  - simple-websocket=1.1.0=pyhd8ed1ab_0
   - six=1.17.0=pyhe01879c_1
   - svt-av1=1.2.0=h27087fc_0
   - sysroot_linux-64=2.39=hc4b9eeb_6
   - tk=8.6.13=noxft_h1df4ec4_4
+  - typing_extensions=4.16.0=pyhcf101f3_0
   - tzdata=2026c=h151e31d_0
   - unicodedata2=18.0.0=py311h0d48ccd_0
   - wayland=1.26.0=hc1c935e_2
   - wayland-protocols=1.49=hd8ed1ab_0
+  - werkzeug=3.1.9=pyh5ded981_0
   - wheel=0.48.0=pyhd8ed1ab_0
+  - wsproto=1.3.2=pyhd8ed1ab_0
   - x264=1!164.3095=h7cc23a3_3
   - x265=3.5=h73f68a7_4
   - xorg-libx11=1.8.13=he1eb515_1

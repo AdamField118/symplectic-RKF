@@ -1,0 +1,245 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Kerr Black Hole</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.2/socket.io.min.js"></script>
+<style>
+  :root {
+    --bg: #07080c; --panel: #11131a; --line: #232736; --text: #e6e8ef;
+    --muted: #8a90a6; --accent: #ffad5c; --accent-dim: #5a3d22;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  body { display: flex; }
+  main { flex: 1; display: flex; align-items: center; justify-content: center;
+    min-width: 0; position: relative; }
+  canvas { width: 100%; height: 100vh; object-fit: contain; cursor: grab; touch-action: none;
+    display: block; }
+  canvas.dragging { cursor: grabbing; }
+  #status { position: absolute; top: 12px; left: 12px; color: var(--muted);
+    font-size: 13px; pointer-events: none; }
+  aside { width: 300px; flex: none; background: var(--panel); border-left: 1px solid var(--line);
+    padding: 16px; overflow-y: auto; }
+  h1 { font-size: 16px; margin: 0 0 2px; }
+  .sub { color: var(--muted); font-size: 12px; margin-bottom: 14px; }
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
+    margin: 18px 0 8px; font-weight: 600; }
+  .stats { display: grid; grid-template-columns: 1fr auto; gap: 2px 12px;
+    font-variant-numeric: tabular-nums; font-size: 13px; }
+  .stats span:nth-child(odd) { color: var(--muted); }
+  .big { font-size: 22px; font-weight: 600; color: var(--accent); }
+  label.row { display: grid; grid-template-columns: 1fr auto; align-items: center;
+    gap: 4px 8px; margin: 10px 0; }
+  label.row input[type=range] { grid-column: 1 / -1; width: 100%; accent-color: var(--accent); }
+  label.row output { color: var(--muted); font-variant-numeric: tabular-nums; }
+  label.check { display: flex; gap: 8px; align-items: center; margin: 8px 0; }
+  input[type=checkbox] { accent-color: var(--accent); }
+  select { width: 100%; background: var(--bg); color: var(--text); border: 1px solid var(--line);
+    border-radius: 6px; padding: 6px; }
+  .buttons { display: flex; gap: 8px; margin-top: 4px; }
+  button { flex: 1; background: var(--accent-dim); color: var(--text); border: 1px solid var(--accent);
+    border-radius: 6px; padding: 8px; font: inherit; cursor: pointer; }
+  button.secondary { background: transparent; border-color: var(--line); }
+  .help { color: var(--muted); font-size: 12px; }
+  @media (max-width: 760px) {
+    body { flex-direction: column; }
+    aside { width: auto; border-left: 0; border-top: 1px solid var(--line); }
+    canvas { height: auto; aspect-ratio: 16 / 9; }
+  }
+</style>
+</head>
+<body>
+<main>
+  <canvas id="view" width="1280" height="720"></canvas>
+  <div id="status">Connecting…</div>
+</main>
+<aside>
+  <h1>Kerr black hole</h1>
+  <div class="sub">Every pixel traced with Bernard Ymeri's symplectic RK4/RK6 integrator</div>
+
+  <div class="buttons">
+    <button id="play">Play flythrough</button>
+    <button id="reset" class="secondary">Reset view</button>
+  </div>
+
+  <h2>Speed</h2>
+  <div class="stats">
+    <span>Frames per second</span><span class="big" id="s-fps">–</span>
+    <span>Drawing (GPU)</span><span id="s-render">–</span>
+    <span>Copy from GPU</span><span id="s-transfer">–</span>
+    <span>JPEG encoding</span><span id="s-encode">–</span>
+    <span>Round trip</span><span id="s-trip">–</span>
+    <span>Frame size</span><span id="s-kb">–</span>
+  </div>
+
+  <h2>Camera</h2>
+  <label class="row">Distance <output id="o-r"></output>
+    <input id="r" type="range" min="0" max="1000" step="1"></label>
+  <label class="row">Field of view <output id="o-fov"></output>
+    <input id="fov" type="range" min="20" max="120" step="1"></label>
+  <div class="stats">
+    <span>Latitude</span><span id="s-lat">–</span>
+    <span>Longitude</span><span id="s-lon">–</span>
+  </div>
+
+  <h2>Black hole</h2>
+  <label class="row">Spin a/M <output id="o-a"></output>
+    <input id="a" type="range" min="0" max="0.998" step="0.002"></label>
+  <label class="check"><input id="disk" type="checkbox"> Accretion disk</label>
+  <label class="check"><input id="doppler" type="checkbox"> Doppler shift and beaming</label>
+  <label class="check"><input id="spin_gas" type="checkbox"> Gas orbits</label>
+  <label class="row">Gas speed (M per second) <output id="o-disk_speed"></output>
+    <input id="disk_speed" type="range" min="0" max="40" step="0.5"></label>
+
+  <h2>Quality</h2>
+  <label class="row">Step size (h = step × r) <output id="o-step"></output>
+    <input id="step" type="range" min="0.01" max="0.3" step="0.01"></label>
+  <label class="row" style="grid-template-columns: 1fr">Resolution
+    <select id="res">
+      <option value="640x360">640 × 360</option>
+      <option value="960x540">960 × 540</option>
+      <option value="1280x720">1280 × 720</option>
+      <option value="1600x900">1600 × 900</option>
+      <option value="1920x1080">1920 × 1080</option>
+      <option value="2560x1440">2560 × 1440</option>
+      <option value="3840x2160">3840 × 2160</option>
+    </select></label>
+  <label class="row">JPEG quality <output id="o-quality"></output>
+    <input id="quality" type="range" min="30" max="95" step="1"></label>
+
+  <h2>Controls</h2>
+  <p class="help">Drag to move around the hole at the same distance, scroll to change the
+    distance. Arrow keys move too, and + and − zoom.</p>
+</aside>
+
+<script>
+const socket = io({path: window.location.pathname.replace(/\/?$/, '/socket.io')});
+const canvas = document.getElementById('view');
+const ctx = canvas.getContext('2d');
+const $ = id => document.getElementById(id);
+const deg = x => (x * 180 / Math.PI).toFixed(1) + '°';
+
+// The distance slider is logarithmic, from 3M to 200M
+const R_MIN = 3, R_MAX = 200;
+const rToSlider = r => 1000 * Math.log(r / R_MIN) / Math.log(R_MAX / R_MIN);
+const sliderToR = v => R_MIN * Math.pow(R_MAX / R_MIN, v / 1000);
+
+let fov = 60, requested = [];   // when each frame on its way was asked for
+let pending = {dphi: 0, dtheta: 0, zoom: 1}, flushQueued = false;
+
+function ready() {
+  requested.push(performance.now());
+  socket.emit('ready');
+}
+
+// Room for two frames at a time: one being drawn while the last is on its way
+socket.on('connect', () => { $('status').textContent = ''; requested = []; ready(); ready(); });
+socket.on('disconnect', () => { $('status').textContent = 'Disconnected. Retrying…'; });
+
+socket.on('settings', s => {
+  fov = s.fov;
+  $('r').value = rToSlider(s.r); $('o-r').textContent = s.r.toFixed(1) + ' M';
+  $('fov').value = s.fov; $('o-fov').textContent = s.fov + '°';
+  $('a').value = s.a; $('o-a').textContent = s.a.toFixed(3);
+  $('step').value = s.step; $('o-step').textContent = s.step.toFixed(2);
+  $('quality').value = s.quality; $('o-quality').textContent = s.quality;
+  $('disk_speed').value = s.disk_speed; $('o-disk_speed').textContent = s.disk_speed;
+  for (const k of ['disk', 'doppler', 'spin_gas']) $(k).checked = s[k];
+  $('res').value = s.width + 'x' + s.height;
+});
+
+socket.on('frame', async msg => {
+  const trip = performance.now() - (requested.shift() ?? performance.now());
+  const bitmap = await createImageBitmap(new Blob([msg.jpeg], {type: 'image/jpeg'}));
+  if (canvas.width !== bitmap.width || canvas.height !== bitmap.height) {
+    canvas.width = bitmap.width; canvas.height = bitmap.height;
+  }
+  ctx.drawImage(bitmap, 0, 0);
+  bitmap.close();
+  ready();
+
+  const st = msg.stats, cam = msg.camera;
+  $('s-fps').textContent = st.fps ? st.fps.toFixed(1) : '–';
+  $('s-render').textContent = st.render_ms.toFixed(1) + ' ms';
+  $('s-transfer').textContent = st.transfer_ms.toFixed(1) + ' ms';
+  $('s-encode').textContent = st.encode_ms.toFixed(1) + ' ms';
+  $('s-trip').textContent = trip.toFixed(0) + ' ms';
+  $('s-kb').textContent = st.kb.toFixed(0) + ' kB';
+  $('s-lat').textContent = deg(Math.PI / 2 - cam.theta);
+  $('s-lon').textContent = deg(cam.phi);
+  if (document.activeElement !== $('r')) {
+    $('r').value = rToSlider(cam.r); $('o-r').textContent = cam.r.toFixed(1) + ' M';
+  }
+  $('play').textContent = cam.playing ? 'Pause' : 'Play flythrough';
+});
+
+// Mouse and keyboard moves are added up and sent once per animation frame
+function queue(dphi, dtheta, zoom) {
+  pending.dphi += dphi; pending.dtheta += dtheta; pending.zoom *= zoom;
+  if (!flushQueued) { flushQueued = true; requestAnimationFrame(flush); }
+}
+function flush() {
+  flushQueued = false;
+  if (pending.dphi || pending.dtheta) socket.emit('orbit', {dphi: pending.dphi, dtheta: pending.dtheta});
+  if (pending.zoom !== 1) socket.emit('zoom', {factor: pending.zoom});
+  pending = {dphi: 0, dtheta: 0, zoom: 1};
+}
+
+// Dragging moves the camera so the picture follows the pointer
+let drag = null;
+canvas.addEventListener('pointerdown', e => {
+  drag = {x: e.clientX, y: e.clientY};
+  canvas.setPointerCapture(e.pointerId); canvas.classList.add('dragging');
+});
+canvas.addEventListener('pointermove', e => {
+  if (!drag) return;
+  // The picture is scaled to fit the page; its height on screen spans the field of view
+  const box = canvas.getBoundingClientRect();
+  const shown = Math.min(box.height, box.width * canvas.height / canvas.width);
+  const k = (fov * Math.PI / 180) / shown;
+  queue(-(e.clientX - drag.x) * k, -(e.clientY - drag.y) * k, 1);
+  drag = {x: e.clientX, y: e.clientY};
+});
+const endDrag = () => { drag = null; canvas.classList.remove('dragging'); };
+canvas.addEventListener('pointerup', endDrag);
+canvas.addEventListener('pointercancel', endDrag);
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  queue(0, 0, Math.exp(e.deltaY * 0.0015));
+}, {passive: false});
+window.addEventListener('keydown', e => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return;
+  const step = 3 * Math.PI / 180;
+  const moves = {ArrowLeft: [step, 0, 1], ArrowRight: [-step, 0, 1], ArrowUp: [0, -step, 1],
+                 ArrowDown: [0, step, 1], '+': [0, 0, 0.9], '=': [0, 0, 0.9], '-': [0, 0, 1.1]};
+  if (moves[e.key]) { e.preventDefault(); queue(...moves[e.key]); }
+});
+
+// Settings
+const set = d => socket.emit('set', d);
+$('r').addEventListener('input', e => {
+  const r = sliderToR(+e.target.value);
+  $('o-r').textContent = r.toFixed(1) + ' M'; set({r});
+});
+$('fov').addEventListener('input', e => {
+  fov = +e.target.value; $('o-fov').textContent = fov + '°'; set({fov});
+});
+for (const [id, fmt] of [['a', v => v.toFixed(3)], ['step', v => v.toFixed(2)],
+                          ['quality', v => v], ['disk_speed', v => v]]) {
+  $(id).addEventListener('input', e => {
+    const v = +e.target.value; $('o-' + id).textContent = fmt(v); set({[id]: v});
+  });
+}
+for (const id of ['disk', 'doppler', 'spin_gas'])
+  $(id).addEventListener('change', e => set({[id]: e.target.checked}));
+$('res').addEventListener('change', e => {
+  const [width, height] = e.target.value.split('x').map(Number); set({width, height});
+});
+$('play').addEventListener('click', () => set({playing: $('play').textContent !== 'Pause'}));
+$('reset').addEventListener('click', () => set({reset: true}));
+</script>
+</body>
+</html>
