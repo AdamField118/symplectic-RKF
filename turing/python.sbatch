@@ -10,6 +10,7 @@
 set -euo pipefail
 cd "${SLURM_SUBMIT_DIR:-$PWD}"
 module load miniconda3
+source $(conda info --base)/etc/profile.d/conda.sh
 conda activate symplectic-rkf
 export MPLBACKEND=Agg
 mkdir -p results
