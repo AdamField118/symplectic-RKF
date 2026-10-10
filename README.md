@@ -37,7 +37,7 @@ step. If they don't, shrink `h` once using the RKF formula and try again.
 | `plot_figures.py` | Bernard's plotting function, used to draw his figures from any version's output. |
 | `compare_results.py` | Prints how far each version's trajectories are from the Python's. |
 | `paper_figures/` | Figures 6(a) and 7(a) as they appear in the MQP PDF, for comparison. |
-| `turing/run_all.sbatch` | The Slurm job that runs all four. |
+| `turing/` | A Slurm job for each version, and `run_all.sbatch`, which submits all four. |
 
 ## Running on Turing
 
@@ -59,18 +59,27 @@ exact version and build from conda-forge (Python 3.11.17, numpy 2.4.6,
 matplotlib 3.10.9, numba 0.68.0, libegl 1.7.0, gcc and gfortran 14.4.0, JAX
 0.10.2 for CUDA 12.9), so it builds the same environment every time.
 
-Then submit the one job, from the repository root:
+Each version has its own Slurm job. Submit from the repository root:
 
 ```bash
-sbatch turing/run_all.sbatch
+sbatch turing/python.sbatch    # 1 CPU core, a few minutes
+sbatch turing/glsl.sbatch      # 1 GPU
+sbatch turing/fortran.sbatch   # 8 CPU cores
+sbatch turing/jax.sbatch       # 1 GPU (8 CPU cores with JAX_PLATFORM=cpu)
 ```
 
-It runs all four versions on Appendix A's Kerr case and Figure 6's
-Schwarzschild case, writes `results/<case>_<version>.npy`, puts the plots in
-`figures/<version>/`, and ends by printing how far each version is from the
-Python. It asks for one GPU and 8 CPU cores. `JAX_PLATFORM=cpu sbatch
-turing/run_all.sbatch` runs the JAX version on the CPU cores instead of the
-GPU.
+or all four at once, as four separate jobs:
+
+```bash
+sbatch turing/run_all.sbatch   # or: bash turing/run_all.sbatch
+```
+
+Each job runs its version on Appendix A's Kerr case and Figure 6's
+Schwarzschild case, writes `results/<case>_<version>.npy`, and puts the plots
+in `figures/<version>/`. `JAX_PLATFORM=cpu sbatch turing/jax.sbatch` runs the
+JAX version on the CPU cores instead of the GPU. Once they've finished,
+`python compare_results.py results` prints how far each version is from the
+Python.
 
 ### The programs
 
