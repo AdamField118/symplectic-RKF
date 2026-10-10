@@ -1,0 +1,399 @@
+#version 430
+// Bernard Ymeri's symplectic RK4/RK6 geodesic integrator (WPI MQP 2026,
+// Appendix A), ported to an OpenGL compute shader.
+//
+// Each invocation integrates one geodesic, so you can hand it a whole grid of
+// initial conditions at once. Everything is done in double precision, like the
+// NumPy original.
+//
+// The functions further down match the Python ones of the same name, and the
+// comments in them are Bernard's, copied as written. GLSL has no double
+// precision sin, cos or pow, so those are written out here: sin/cos follow the
+// FreeBSD libm code, and the one power the algorithm needs, x**(1/5), uses a
+// float first guess cleaned up with Newton's method.
+
+layout(local_size_x = 64) in;
+
+// Filled in by main.c, which computes the RK coefficients the same way the
+// Python module does.
+layout(std430, binding = 0) readonly buffer Params {
+    double M;
+    double a;
+    double h;
+    double r4a11, r4a12, r4a21, r4a22, r4b1, r4b2;
+    double r6a11, r6a12, r6a13;
+    double r6a21, r6a22, r6a23;
+    double r6a31, r6a32, r6a33;
+    double r6b1, r6b2, r6b3;
+};
+
+// Where each geodesic currently is: (t, r, theta, phi, p_t, p_r, p_theta,
+// p_phi). Kept between dispatches.
+layout(std430, binding = 1) buffer State {
+    double state[];
+};
+
+// The steps taken during this dispatch, laid out as
+// traj[(geodesic * chunk + step) * 8 + component].
+layout(std430, binding = 2) writeonly buffer Traj {
+    double traj[];
+};
+
+uniform int n_geodesics;
+uniform int chunk;          // how many steps this dispatch takes
+
+// Double precision sin and cos, from FreeBSD's libm (k_sin.c, k_cos.c and the
+// medium-size path of e_rem_pio2.c). The `precise` qualifiers keep the
+// compiler from fusing multiplies and adds, since the error-correcting sums
+// below depend on each operation being rounded separately.
+double kernel_sin(double x, double y, int iy) {
+    const double S1 = -1.66666666666666324348e-01LF;
+    const double S2 =  8.33333333332248946124e-03LF;
+    const double S3 = -1.98412698298579493134e-04LF;
+    const double S4 =  2.75573137070700676789e-06LF;
+    const double S5 = -2.50507602534068634195e-08LF;
+    const double S6 =  1.58969099521155010221e-10LF;
+    precise double z = x * x;
+    precise double w = z * z;
+    precise double r = S2 + z * (S3 + z * S4) + z * w * (S5 + z * S6);
+    precise double v = z * x;
+    precise double res;
+    if (iy == 0) res = x + v * (S1 + z * r);
+    else         res = x - ((z * (0.5LF * y - v * r) - y) - v * S1);
+    return res;
+}
+
+double kernel_cos(double x, double y) {
+    const double C1 =  4.16666666666666019037e-02LF;
+    const double C2 = -1.38888888888741095749e-03LF;
+    const double C3 =  2.48015872894767294178e-05LF;
+    const double C4 = -2.75573143513906633035e-07LF;
+    const double C5 =  2.08757232129817482790e-09LF;
+    const double C6 = -1.13596475577881948265e-11LF;
+    precise double z = x * x;
+    precise double w = z * z;
+    precise double r = z * (C1 + z * (C2 + z * C3)) + w * w * (C4 + z * (C5 + z * C6));
+    precise double hz = 0.5LF * z;
+    precise double ww = 1.0LF - hz;
+    precise double res = ww + (((1.0LF - ww) - hz) + (z * r - x * y));
+    return res;
+}
+
+int high_exponent(double v) {
+    return int((unpackDouble2x32(v).y >> 20) & 0x7ffu);
+}
+
+// Splits x into n*pi/2 + (y0 + y1) with |y0 + y1| <= pi/4. Good for
+// |x| < 2^20 * pi/2, far more than the angles here ever reach.
+int rem_pio2(double x, out double y0, out double y1) {
+    const double invpio2 = 6.36619772367581382433e-01LF;
+    const double pio2_1  = 1.57079632673412561417e+00LF;
+    const double pio2_1t = 6.07710050650619224932e-11LF;
+    const double pio2_2  = 6.07710050630396597660e-11LF;
+    const double pio2_2t = 2.02226624879595063154e-21LF;
+    const double pio2_3  = 2.02226624871116645580e-21LF;
+    const double pio2_3t = 8.47842766036889956997e-32LF;
+    precise double fn = roundEven(x * invpio2);
+    int n = int(fn);
+    precise double r = x - fn * pio2_1;
+    precise double w = fn * pio2_1t;
+    precise double t;
+    int j = high_exponent(x);
+    y0 = r - w;
+    if (j - high_exponent(y0) > 16) {
+        t = r;
+        w = fn * pio2_2;
+        r = t - w;
+        w = fn * pio2_2t - ((t - r) - w);
+        y0 = r - w;
+        if (j - high_exponent(y0) > 49) {
+            t = r;
+            w = fn * pio2_3;
+            r = t - w;
+            w = fn * pio2_3t - ((t - r) - w);
+            y0 = r - w;
+        }
+    }
+    y1 = (r - y0) - w;
+    return n;
+}
+
+double dsin(double x) {
+    if (abs(x) <= 7.85398163397448278999e-01LF) return kernel_sin(x, 0.0LF, 0);
+    double y0, y1;
+    int n = rem_pio2(x, y0, y1);
+    switch (n & 3) {
+        case 0:  return  kernel_sin(y0, y1, 1);
+        case 1:  return  kernel_cos(y0, y1);
+        case 2:  return -kernel_sin(y0, y1, 1);
+        default: return -kernel_cos(y0, y1);
+    }
+    return 0.0LF;  // never reached
+}
+
+double dcos(double x) {
+    if (abs(x) <= 7.85398163397448278999e-01LF) return kernel_cos(x, 0.0LF);
+    double y0, y1;
+    int n = rem_pio2(x, y0, y1);
+    switch (n & 3) {
+        case 0:  return  kernel_cos(y0, y1);
+        case 1:  return -kernel_sin(y0, y1, 1);
+        case 2:  return -kernel_cos(y0, y1);
+        default: return  kernel_sin(y0, y1, 1);
+    }
+    return 0.0LF;  // never reached
+}
+
+// x**(1/5) for x >= 0. The only caller passes tol/error.
+double fifth_root(double x) {
+    if (!(x > 0.0LF) || isinf(x)) return (x == 0.0LF) ? 0.0LF : x;
+    int e;
+    double m = frexp(x, e);                 // x = m * 2^e with m in [0.5, 1)
+    int q = (e >= 0) ? e / 5 : -((-e + 4) / 5);
+    m = ldexp(m, e - 5 * q);                // now m is in [0.5, 16)
+    double y = double(pow(float(m), 0.2));  // ~1e-7 relative
+    for (int i = 0; i < 3; i++) {           // Newton steps on y^5 = m
+        double y4 = y * y * y * y;
+        y = y - (y4 * y - m) / (5.0LF * y4);
+    }
+    return ldexp(y, q);
+}
+
+// From here on it's Appendix A.
+
+// Inverse Kerr metric (uses the inverse metric like the Fantasty code). Takes in
+//a vector of length 4 representing the 4 Boyder-Lindquist coordinates: t, r,
+//theta, and phi
+void inverse_metric(double x[4], out double g[4][4]) {
+
+    double t = x[0];
+    double r = x[1];
+    double theta = x[2];
+    double phi = x[3];
+
+    //Making it easier and more compact to write out the full Kerr metric
+    double cos_theta = dcos(theta);
+    double Sigma = r*r + (a*a) * (cos_theta*cos_theta);
+    double Delta = r*r - 2.0LF*M*r + a*a;
+    double sin_theta = dsin(theta);
+
+    //Input all the spacetime metric components (Kerr for this example)
+    g[0][0] = -((r*r + a*a)*(r*r + a*a) - (a*a) * Delta * (sin_theta*sin_theta)) / (Delta * Sigma);
+    g[0][1] = 0.0LF;
+    g[0][2] = 0.0LF;
+    g[0][3] = -2.0LF * M * a * r / (Delta * Sigma);
+
+    g[1][0] = g[0][1];
+    g[1][1] = Delta / Sigma;
+    g[1][2] = 0.0LF;
+    g[1][3] = 0.0LF;
+
+    g[2][0] = g[0][2];
+    g[2][1] = g[1][2];
+    g[2][2] = 1.0LF / Sigma;
+    g[2][3] = 0.0LF;
+
+    g[3][0] = g[0][3];
+    g[3][1] = g[1][3];
+    g[3][2] = g[2][3];
+    g[3][3] = (Delta - (a*a) * (sin_theta*sin_theta)) / (Delta * Sigma * (sin_theta*sin_theta));
+}
+
+// Numerical derivatives of inverse metric
+void dgdx(double x[4], out double dg[4][4][4]) {
+    const double delta = 1e-6LF;
+
+    // Uses central finite differences to approximate each partial derivative.
+    //The n-th loop computes all 4 partial derivatives for the n-th spacetime
+    //coordinate.
+    for (int w = 0; w < 4; w++) {
+        double x_plus[4] = x;
+        double x_minus[4] = x;
+        x_plus[w] = x[w] + delta;
+        x_minus[w] = x[w] - delta;
+        double g_plus[4][4], g_minus[4][4];
+        inverse_metric(x_plus, g_plus);
+        inverse_metric(x_minus, g_minus);
+        for (int i = 0; i < 4; i++)
+            for (int j = 0; j < 4; j++)
+                dg[w][i][j] = (g_plus[i][j] - g_minus[i][j]) / (2.0LF * delta);
+    }
+}
+
+// Hamiltonian
+void hamiltonian(double y[8], out double dydt[8]) {
+    // Takes the first n elements of the initial conditions vector y (these
+    //correspond to the position coordinates) and the last n elements of y (these
+    //correspond to the momentum coordinates), and makes them their own vectors.
+    double x[4] = double[4](y[0], y[1], y[2], y[3]);
+    double p[4] = double[4](y[4], y[5], y[6], y[7]);
+
+    double g[4][4];
+    double dg[4][4][4];
+    inverse_metric(x, g);
+    dgdx(x, dg);
+
+    // Following the Hamiltonian equations for geodesics, we calculate the
+    //derivatives of the position and momentum components
+    for (int i = 0; i < 4; i++) {
+        double s = 0.0LF;
+        for (int j = 0; j < 4; j++) s += g[i][j] * p[j];
+        dydt[i] = s;
+    }
+
+    // Uses a triple for-loop to sum over the 3 indices in the equation for the
+    //momentum derivative
+    for (int w = 0; w < 4; w++) {
+        double dp = 0.0LF;
+        for (int u = 0; u < 4; u++)
+            for (int v = 0; v < 4; v++)
+                dp = dp - 0.5LF * dg[w][u][v] * p[u] * p[v];
+        dydt[4 + w] = dp;
+    }
+}
+
+double norm8(double v[8]) {
+    double s = 0.0LF;
+    for (int i = 0; i < 8; i++) s += v[i] * v[i];
+    return sqrt(s);
+}
+
+// Symplectic RK4 step, uses fixed point iteration to solve the implicit RK method
+void symplectic_rk4(double y[8], double h, double tol, int max_iter, out double y_next[8]) {
+    // Gives the initial guess for k1 and k2 based on the input
+    double k1[8], k2[8];
+    hamiltonian(y, k1);
+    k2 = k1;  // f(y) gives the same answer every time, so call it once
+
+    // Updates k1 and k2 based on the symplectic rk4 coefficients and the previous
+    //guess for k1 and k2.
+    for (int it = 0; it < max_iter; it++) {
+        double y1[8], y2[8], k1_new[8], k2_new[8];
+        for (int i = 0; i < 8; i++) {
+            y1[i] = y[i] + h * (r4a11 * k1[i] + r4a12 * k2[i]);
+            y2[i] = y[i] + h * (r4a21 * k1[i] + r4a22 * k2[i]);
+        }
+        hamiltonian(y1, k1_new);
+        hamiltonian(y2, k2_new);
+
+        // Checks if the difference (in the regular 2-norm) of k1 and the updated
+        //k1 is less than the given tolerance, and if the same is true for k2 and
+        //the updated k2.
+        double d1[8], d2[8];
+        for (int i = 0; i < 8; i++) { d1[i] = k1_new[i] - k1[i]; d2[i] = k2_new[i] - k2[i]; }
+        if ((norm8(d1) < tol) && (norm8(d2) < tol)) {
+            break;
+        }
+
+        // Replaces the previous guess with the new one
+        k1 = k1_new;
+        k2 = k2_new;
+    }
+
+    // Uses the final guesses and the symplectic rk4 coefficients to update y.
+    for (int i = 0; i < 8; i++) y_next[i] = y[i] + h * (r4b1 * k1[i] + r4b2 * k2[i]);
+}
+
+// Symplectic RK6 step, uses fixed point iteration to solve the implicit RK method
+void symplectic_rk6(double y[8], double h, double tol, int max_iter, out double y_next[8]) {
+    // Gives the initial guess for k1, k2, and k3 based on the input
+    double k1[8], k2[8], k3[8];
+    hamiltonian(y, k1);
+    k2 = k1;  // f(y) gives the same answer every time, so call it once
+    k3 = k1;
+
+    // Checks if the difference (in the regular 2-norm) of k1 and the updated
+    //k1 is less than the given tolerance, and if the same is true for k2 and
+    //the updated k2, and k3 and the updated k3.
+    for (int it = 0; it < max_iter; it++) {
+        double y1[8], y2[8], y3[8], k1_new[8], k2_new[8], k3_new[8];
+        for (int i = 0; i < 8; i++) {
+            y1[i] = y[i] + h * (r6a11*k1[i] + r6a12*k2[i] + r6a13*k3[i]);
+            y2[i] = y[i] + h * (r6a21*k1[i] + r6a22*k2[i] + r6a23*k3[i]);
+            y3[i] = y[i] + h * (r6a31*k1[i] + r6a32*k2[i] + r6a33*k3[i]);
+        }
+        hamiltonian(y1, k1_new);
+        hamiltonian(y2, k2_new);
+        hamiltonian(y3, k3_new);
+
+        // Convergence check (2-norm)
+        double d1[8], d2[8], d3[8];
+        for (int i = 0; i < 8; i++) {
+            d1[i] = k1_new[i] - k1[i]; d2[i] = k2_new[i] - k2[i]; d3[i] = k3_new[i] - k3[i];
+        }
+        if (norm8(d1) < tol &&
+            norm8(d2) < tol &&
+            norm8(d3) < tol) {
+            break;
+        }
+
+        // Replaces the previous guess with the new one
+        k1 = k1_new;
+        k2 = k2_new;
+        k3 = k3_new;
+    }
+
+    // Uses the final guesses and the symplectic rk6 coefficients to update y.
+    for (int i = 0; i < 8; i++) y_next[i] = y[i] + h * (r6b1*k1[i] + r6b2*k2[i] + r6b3*k3[i]);
+}
+
+// We'll compute an rk4 and an rk6 step, find the error between them, and decide
+//whether to accept the rk4 step, or shrink the step size and try again until the
+//error is less than a given tolerance.
+void symplectic_rk46_comparison(double y[8], double h, out double y_rk4[8]) {
+    const double tol = 0.1LF;
+    const int max_shrinks = 1;
+    const double rk_tol = 5e-11LF;
+    const int rk_max_iter = 20;
+
+    // Define the current default step size
+    double h_current = h;
+
+    // A for loop = computes an rk4 and rk6 step until the error between them is
+    //below a given tolerance, then computes them again with a smaller step size
+    //if it's not
+    for (int it = 0; it < max_shrinks + 1; it++) {
+
+        // Compute a symplectic rk4 step
+        symplectic_rk4(y, h_current, rk_tol, rk_max_iter, y_rk4);
+
+        // Compute a symplectic rk6 step
+        double y_rk6[8];
+        symplectic_rk6(y, h_current, rk_tol, rk_max_iter, y_rk6);
+
+        // Find the 2 norm of their difference
+        double d[8];
+        for (int i = 0; i < 8; i++) d[i] = y_rk6[i] - y_rk4[i];
+        double error = norm8(d);
+
+        // Accept symplectic rk4 step if error is below the tolerance
+        if (error < tol) {
+            return;
+        }
+
+        // Update step size using formula that's used in the rkf method
+        h_current = 0.9LF * h_current * fifth_root(tol / error);
+    }
+
+    // If the error still isn't below the tolerance after max_shrinks, accept the rk4 step
+}
+
+// Integrate Geodesic (just this dispatch's share of the steps)
+void main() {
+    int gid = int(gl_GlobalInvocationID.x);
+    if (gid >= n_geodesics) return;
+
+    double y[8];
+    for (int i = 0; i < 8; i++) y[i] = state[gid * 8 + i];
+
+    // Compute the position/momentum vector using the symplectic rk4, adds it to the
+    //trajectory list, and then computes the next position/momentum in the geodesic
+    for (int s = 0; s < chunk; s++) {
+        double y_new[8];
+        symplectic_rk46_comparison(y, h, y_new);
+        y = y_new;
+        for (int i = 0; i < 8; i++) traj[(gid * chunk + s) * 8 + i] = y[i];
+    }
+
+    for (int i = 0; i < 8; i++) state[gid * 8 + i] = y[i];
+}

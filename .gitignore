@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+
+# Build output
+glsl/geodesic
+
+# Run output
+results/
+figures/
+*.png
+*.err
+*.out
+
+# Include the reference figures
+!fig6a_schwarzschild_bernard.png
+!fig7a_kerr_bernard.png
