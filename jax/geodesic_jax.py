@@ -79,28 +79,20 @@ def inverse_metric(x):
     Delta = r**2 - 2*M*r + a**2
 
     #Set up a 4x4 matrix of zeroes
-    g = jnp.zeros((4, 4))
-
     #Input all the spacetime metric components (Kerr for this example)
-    g = g.at[0, 0].set(-((r**2 + a**2)**2 - a**2 * Delta * jnp.sin(theta)**2) / (Delta * Sigma))
-    g = g.at[0, 1].set(0.0)
-    g = g.at[0, 2].set(0.0)
-    g = g.at[0, 3].set(-2 * M * a * r / (Delta * Sigma))
-
-    g = g.at[1, 0].set(g[0, 1])
-    g = g.at[1, 1].set(Delta / Sigma)
-    g = g.at[1, 2].set(0.0)
-    g = g.at[1, 3].set(0.0)
-
-    g = g.at[2, 0].set(g[0, 2])
-    g = g.at[2, 1].set(g[1, 2])
-    g = g.at[2, 2].set(1.0 / Sigma)
-    g = g.at[2, 3].set(0.0)
-
-    g = g.at[3, 0].set(g[0, 3])
-    g = g.at[3, 1].set(g[1, 3])
-    g = g.at[3, 2].set(g[2, 3])
-    g = g.at[3, 3].set((Delta - a**2 * jnp.sin(theta)**2) / (Delta * Sigma * jnp.sin(theta)**2))
+    # JAX: the same entries, but the matrix is built in one go instead of with
+    # 16 .at[].set() updates. Under jit every one of those is a separate
+    # operation, and this function runs 9 times per hamiltonian() call.
+    g00 = -((r**2 + a**2)**2 - a**2 * Delta * jnp.sin(theta)**2) / (Delta * Sigma)
+    g03 = -2 * M * a * r / (Delta * Sigma)
+    g11 = Delta / Sigma
+    g22 = 1.0 / Sigma
+    g33 = (Delta - a**2 * jnp.sin(theta)**2) / (Delta * Sigma * jnp.sin(theta)**2)
+    zero = jnp.zeros_like(r)
+    g = jnp.stack([jnp.stack([g00, zero, zero, g03]),
+                   jnp.stack([zero, g11, zero, zero]),
+                   jnp.stack([zero, zero, g22, zero]),
+                   jnp.stack([g03, zero, zero, g33])])
 
     return g
 
@@ -112,17 +104,18 @@ def dgdx(x, delta=1e-6):
     #that will hold all the partial derivvatives of every entry of the inverse metric
     #matrix
     n = len(x)
-    dg = jnp.zeros((n, n, n))
 
     # Uses central finite differences to approximate each partial derivative.
     #The n-th loop computes all 4 partial derivatives for the n-th spacetime
     #coordinate.
-    for w in range(n):
-        dx = jnp.zeros(n)
-        dx = dx.at[w].set(delta)
-        g_plus = inverse_metric(x + dx)
-        g_minus = inverse_metric(x - dx)
-        dg = dg.at[w].set((g_plus - g_minus) / (2 * delta))
+    # JAX: all n of those loop passes at once. Row w of dx is the dx of pass w
+    # (delta in slot w, zeros elsewhere), and jax.vmap evaluates the metric at
+    # all of x + dx (and x - dx) together; dg[w] is the same as before. A
+    # Python loop would be unrolled into n copies of everything under jit.
+    dx = delta * jnp.eye(n)
+    g_plus = jax.vmap(inverse_metric)(x + dx)
+    g_minus = jax.vmap(inverse_metric)(x - dx)
+    dg = (g_plus - g_minus) / (2 * delta)
 
     return dg
 
@@ -148,10 +141,12 @@ def hamiltonian(y):
 
     # Uses a triple for-loop to sum over the 3 indices in the equation for the
     #momentum derivative
-    for w in range(n):
-        for u in range(n):
-            for v in range(n):
-                dp = dp.at[w].set(dp[w] - 0.5 * dg[w, u, v] * p[u] * p[v])
+    # JAX: the w loop is done for all w at once (dp and dg[:, u, v] are vectors
+    # over w), so each dp[w] gets the same terms subtracted in the same (u, v)
+    # order as before: 16 vector updates instead of 64 single-element ones.
+    for u in range(n):
+        for v in range(n):
+            dp = dp - 0.5 * dg[:, u, v] * p[u] * p[v]
 
     return jnp.concatenate([dx, dp])
 
@@ -367,7 +362,11 @@ def main():
     while done < steps:
         c = min(chunk, steps - done)
         if c not in compiled:
-            compiled[c] = advance(y, c)
+            # Compiled ahead of time, once per chunk length (normally just one),
+            # so the log shows compile time apart from the time spent stepping.
+            t = time.perf_counter()
+            compiled[c] = advance(y, c).lower(y).compile()
+            print(f"compiled {c}-step program in {time.perf_counter() - t:.1f} s", file=sys.stderr)
         y, rows = compiled[c](y)
         traj[:, done + 1:done + 1 + c] = np.asarray(rows)[:n_ic]
         done += c

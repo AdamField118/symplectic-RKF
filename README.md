@@ -134,9 +134,17 @@ python jax/geodesic_jax.py --platform cpu --out results/kerr_jax.npy
 `--platform gpu` runs on the GPU. `--platform cpu` makes one JAX device per
 CPU core (`SLURM_CPUS_PER_TASK`, or all of them) and splits the geodesics
 between them. Either way the geodesics in a device's share run together, and
-each `--chunk` of steps is one compiled program. Compiling takes about 30 s
-the first time. On 4 CPU cores one geodesic then takes about 40 s; JAX pays
-off with many geodesics, or on a GPU.
+each `--chunk` of steps is one compiled program, compiled once and reused for
+every chunk (the log prints how long compiling took). On a CPU, one geodesic
+takes about 4 s in all: about 3 s to compile, then about 1.3 s for the 15,000
+steps.
+
+Python loops inside JAX code are unrolled when it's compiled, so Bernard's
+loops over the metric's entries, the four coordinates in `dgdx`, and the
+64-term momentum sum are written as whole-array operations instead (same
+arithmetic, same order). Written as loops, they made the compiled program 15
+times bigger, took 14 s to compile, and launched about 1,500 small operations
+per step, which is what made the GPU version slow.
 
 ## Reproducing the figures in the paper
 
@@ -167,7 +175,7 @@ numbers was:
 |---|---|---|
 | C + GLSL | 1.6e-6 | 1.0e-5 |
 | Fortran | 1.7e-6 | 2.9e-6 |
-| JAX | 9.3e-7 | 9.8e-7 |
+| JAX | 8.2e-7 | 9.8e-7 |
 
 All of them keep the Hamiltonian constant to within a few times 1e-10, and
 their plots are identical to the Python's (and match the figures in the paper
@@ -179,10 +187,14 @@ sum can make it stop one iteration earlier or later. That shows up as
 differences around 1e-11 per step, which add up to the 1e-6 above.
 
 The Fortran version is the Python's code line for line, in order. The JAX
-version changes only what JAX requires: `jnp` for `np`, `.at[].set()` instead
-of writing into arrays, and `lax.while_loop` for the loops that `break` or
-`return` early (with the same result on the iteration that stops). Each change
-is marked `JAX:` in the code.
+version changes only what JAX requires: `jnp` for `np`, `lax.while_loop` for
+the loops that `break` or `return` early (with the same result on the
+iteration that stops), and whole-array operations instead of loops that write
+one entry at a time (above). Each change is marked `JAX:` in the code. XLA,
+the compiler under JAX, also fuses `a*b + c` into a single fused multiply-add,
+rounding once where NumPy rounds twice, and where it does so depends on how
+the program is laid out. That's why JAX's numbers differ slightly between
+runs on different numbers of devices.
 
 A few things in the shader work differently from the Python, but give the same
 results:
